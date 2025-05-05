@@ -4,6 +4,7 @@ extern "C" {
 #endif
 
 enum partitioning_type {
+  PARTITION_SUPREME,
   PARTITION_GLOBAL,
   PARTITION_STREAM,
   PARTITION_STREAM_OVERRIDE,

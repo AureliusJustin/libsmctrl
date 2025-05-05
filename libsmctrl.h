@@ -1,5 +1,5 @@
 /**
- * Copyright 2022-2024 Joshua Bakita
+ * Copyright 2022-2025 Joshua Bakita
  * Library to control TPC masks on CUDA launches. Co-opts preexisting debug
  * logic in the CUDA driver library, and thus requires a build with -lcuda.
  */
@@ -58,11 +58,13 @@ extern void libsmctrl_set_next_mask(uint64_t mask);
 // Get number of GPCs for devices number `dev`, and a GPC-indexed array
 // containing masks of which TPCs are associated with each GPC.
 // Note that the `nvdebug` module must be loaded to use this function.
+// Note that at least one GPU context must be active to use this function.
 // @param  num_enabled_gpcs (out) Location to store number of GPCs in
 // @param  tpcs_for_gpc     (out) Pointer to store pointer to output buffer at
 // @param  dev               (in) `nvdebug` device ID
 // @return 0 on success, `errno`-compatible error code on failure
 extern int libsmctrl_get_gpc_info(uint32_t* num_enabled_gpcs, uint64_t** tpcs_for_gpc, int dev);
+extern int libsmctrl_get_gpc_info_ext(uint32_t* num_enabled_gpcs, uint128_t** tpcs_for_gpc, int dev);
 // Get total number of TPCs on device number `dev`. Requires `nvdebug`.
 // @param  num_tpcs        (out) Location to store number of TPCs at
 // @param  dev              (in) `nvdebug` device ID

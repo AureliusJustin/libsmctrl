@@ -1,9 +1,10 @@
-// Copyright 2023 Joshua Bakita
+// Copyright 2023-2025 Joshua Bakita
 #include <error.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include <cuda_runtime.h>
+#include <unistd.h> // For getpid()
 
 #include "libsmctrl.h"
 #include "testbench.h"
@@ -81,6 +82,10 @@ int test_constrained_size_and_location(enum partitioning_type part_type) {
 
     // Apply partitioning to enable only the first TPC of each 32-bit block
     switch (part_type) {
+      case PARTITION_SUPREME:
+        printf("%s: Please set mask to '0x%016lx%016lx' for PID %d using the control deamon and press any key to continue...\n", program_invocation_name, (uint64_t)(mask >> 64), (uint64_t)mask, getpid());
+        fgetc(stdin);
+        break;
       case PARTITION_GLOBAL:
         libsmctrl_set_global_mask(mask);
         break;

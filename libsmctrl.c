@@ -31,6 +31,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
 #include <unistd.h>
 
 #include "libsmctrl.h"
@@ -52,6 +54,8 @@ static const CUuuid callback_funcs_id = {0x2c, (char)0x8e, 0x0a, (char)0xd8, 0x0
 // structures, allowing us to override it with the next mask.
 #define QMD_DOMAIN 0xb
 #define QMD_PRE_UPLOAD 0x1
+// Supreme mask (cannot be overridden)
+static uint64_t *g_supreme_sm_mask = NULL;
 // Global mask (applies across all threads)
 static uint64_t g_sm_mask = 0;
 // Next mask (applies per-thread)
@@ -108,6 +112,13 @@ static void control_callback_v2(void *ukwn, int domain, int cbid, const void *in
 		// Only apply the global mask if a per-stream mask hasn't been set
 		*lower_ptr = (uint32_t)g_sm_mask;
 		*upper_ptr = (uint32_t)(g_sm_mask >> 32);
+	}
+
+	// No one may override the supreme SM mask; any SMs disabled in it (set
+	// bits) must always remain disabled.
+	if (g_supreme_sm_mask) {
+		*lower_ptr |= (uint32_t)*g_supreme_sm_mask;
+		*upper_ptr |= (uint32_t)(*g_supreme_sm_mask >> 32);
 	}
 
 	//fprintf(stderr, "Final SM Mask (lower): %x\n", *lower_ptr);
@@ -423,13 +434,30 @@ static int read_int_procfile(char* filename, uint64_t* out) {
 	return 0;
 }
 
-// We support up to 64 TPCs, up to 12 GPCs per GPU, and up to 16 GPUs.
-// TODO: Handle GPUs with greater than 64 TPCs (e.g. some H100 variants)
-static uint64_t tpc_mask_per_gpc_per_dev[16][12];
+// We support up to 128 TPCs, up to 12 GPCs per GPU, and up to 16 GPUs.
+#define MAX_GPCS 12
+static uint64_t tpc_mask_per_gpc_per_dev[16][MAX_GPCS];
+static uint128_t tpc_mask_per_gpc_per_dev_ext[16][MAX_GPCS];
 // Output mask is vtpc-indexed (virtual TPC)
+// Note that this function has to undo _both_ floorsweeping and ID remapping
 int libsmctrl_get_gpc_info(uint32_t* num_enabled_gpcs, uint64_t** tpcs_for_gpc, int dev) {
-	uint32_t i, j, vtpc_idx = 0;
-	uint64_t gpc_mask, num_tpc_per_gpc, max_gpcs, gpc_tpc_mask;
+	int err, i;
+	uint128_t *tpcs_for_gpc_ext;
+	if ((err = libsmctrl_get_gpc_info_ext(num_enabled_gpcs, &tpcs_for_gpc_ext, dev)))
+		return err;
+	for (i = 0; i < *num_enabled_gpcs; i++) {
+		if ((tpcs_for_gpc_ext[i] & -1ull) != tpcs_for_gpc_ext[i])
+			return ERANGE;
+		tpc_mask_per_gpc_per_dev[dev][i] = (uint64_t)tpcs_for_gpc_ext[i];
+	}
+	*tpcs_for_gpc = tpc_mask_per_gpc_per_dev[dev];
+	return 0;
+}
+
+int libsmctrl_get_gpc_info_ext(uint32_t* num_enabled_gpcs, uint128_t** tpcs_for_gpc, int dev) {
+	uint32_t i, j, tpc_id, gpc_id, num_enabled_tpcs, num_configured_tpcs;
+	uint64_t gpc_mask, num_tpc_per_gpc, max_gpcs, gpc_tpc_mask, gpc_tpc_config, total_read = 0;
+	uint128_t tpc_bit;
 	int err;
 	char filename[100];
 	*num_enabled_gpcs = 0;
@@ -449,43 +477,79 @@ int libsmctrl_get_gpc_info(uint32_t* num_enabled_gpcs, uint64_t** tpcs_for_gpc, 
 	snprintf(filename, 100, "/proc/gpu%d/gpc_mask", dev);
 	if (err = read_int_procfile(filename, &gpc_mask))
 		return err;
+	// Determine the number of enabled TPCs
 	snprintf(filename, 100, "/proc/gpu%d/num_tpc_per_gpc", dev);
 	if (err = read_int_procfile(filename, &num_tpc_per_gpc))
 		return err;
 	// For each enabled GPC
+	num_enabled_tpcs = 0;
 	for (i = 0; i < max_gpcs; i++) {
 		// Skip this GPC if disabled
 		if ((1 << i) & gpc_mask)
 			continue;
 		(*num_enabled_gpcs)++;
-		// Get the bitstring of TPCs disabled for this GPC
+		// Get the bitstring of TPCs disabled for this physical GPC
 		// Set bit = disabled TPC
 		snprintf(filename, 100, "/proc/gpu%d/gpc%d_tpc_mask", dev, i);
 		if (err = read_int_procfile(filename, &gpc_tpc_mask))
 			return err;
-		uint64_t* tpc_mask = &tpc_mask_per_gpc_per_dev[dev][*num_enabled_gpcs - 1];
-		*tpc_mask = 0;
-		for (j = 0; j < num_tpc_per_gpc; j++) {
-				// Skip disabled TPCs
-				if ((1 << j) & gpc_tpc_mask)
-					continue;
-				*tpc_mask |= (1ull << vtpc_idx);
-				vtpc_idx++;
+		// Bits greater than the max number of TPCs should be ignored, so only
+		// keep the `num_tpc_per_gpc`-count number of lower bits.
+		gpc_tpc_mask &= -1u >> (64 - num_tpc_per_gpc);
+		// Number of enabled TPCs = max - number disabled
+		num_enabled_tpcs += num_tpc_per_gpc - __builtin_popcountl(gpc_tpc_mask);
+	}
+	// Clear any previous mask
+	for (i = 0; i < MAX_GPCS; i++)
+		tpc_mask_per_gpc_per_dev_ext[dev][i] = 0;
+	// For each enabled TPC
+	for (tpc_id = 0; tpc_id < num_enabled_tpcs;) {
+		// Pull mapping for the next set of 4 TPCs
+		snprintf(filename, 100, "/proc/gpu%d/CWD_GPC_TPC_ID%d", dev, tpc_id / 4);
+		if (err = read_int_procfile(filename, &gpc_tpc_config))
+			return err;
+		total_read += gpc_tpc_config;
+		for (j = 0; j < 4 && tpc_id < num_enabled_tpcs; j++, tpc_id++) {
+			// Set the bit for the current TPC
+			tpc_bit = 1;
+			tpc_bit <<= tpc_id;
+			// Determine which GPC the current TPC is associated with
+			// (upper 4 bits of each byte)
+			gpc_id = (gpc_tpc_config >> (j*8 + 4) & 0xfu);
+			// Save mapping
+			tpc_mask_per_gpc_per_dev_ext[dev][gpc_id] |= tpc_bit;
 		}
 	}
-	*tpcs_for_gpc = tpc_mask_per_gpc_per_dev[dev];
+	// Verify each TPC is configured
+	tpc_bit = 0;
+	for (i = 0; i < MAX_GPCS; i++)
+		tpc_bit |= tpc_mask_per_gpc_per_dev_ext[dev][i];
+	num_configured_tpcs = __builtin_popcountl(tpc_bit) + __builtin_popcountl(tpc_bit >> 64);
+	if (num_configured_tpcs != num_enabled_tpcs) {
+		fprintf(stderr, "libsmctrl: Found configuration for only %d TPCs when %d were expected.\n", num_configured_tpcs, num_enabled_tpcs);
+		return EIO;
+	}
+	// Verify that the configuration was not always zero (indicates a powered-
+	// -off GPU).
+	if (total_read == 0) {
+		fprintf(stderr, "libsmctrl: Is GPU on? Configuration registers are all zero.\n");
+		return EIO;
+	}
+
+	*tpcs_for_gpc = tpc_mask_per_gpc_per_dev_ext[dev];
 	return 0;
 }
 
 int libsmctrl_get_tpc_info(uint32_t* num_tpcs, int dev) {
 	uint32_t num_gpcs;
-	uint64_t* tpcs_per_gpc;
+	uint128_t* tpcs_per_gpc;
 	int res;
-	if (res = libsmctrl_get_gpc_info(&num_gpcs, &tpcs_per_gpc, dev))
+	if (res = libsmctrl_get_gpc_info_ext(&num_gpcs, &tpcs_per_gpc, dev))
 		return res;
 	*num_tpcs = 0;
 	for (int gpc = 0; gpc < num_gpcs; gpc++) {
 		*num_tpcs += __builtin_popcountl(tpcs_per_gpc[gpc]);
+		*num_tpcs += __builtin_popcountl(tpcs_per_gpc[gpc] >> 64);
 	}
 	return 0;
 }
@@ -526,3 +590,68 @@ abort_cuda:
 	return EIO;
 }
 
+// Allow setting a default mask via an environment variable
+// Also enables libsmctrl to be used on unmodified programs via setting:
+//   LD_PRELOAD=libsmctrl.so LIBSMCTRL_MASK=<your mask> ./my_program
+// Where "<your mask>" is replaced with a disable mask, optionally prefixed
+// with a ~ to invert it (make it an enable mask).
+__attribute__((constructor)) static void setup(void) {
+	char *end, *mask_str;
+	// If dynamic changes are disabled (due to an error) this variable is
+	// permanently used to store the supreme mask, rather than the SysV shared
+	// memory segment.
+	static uint64_t mask;
+	bool invert = false;
+	int shmid;
+	key_t shm_key;
+
+	mask_str = getenv("LIBSMCTRL_MASK");
+	if (!mask_str)
+		return;
+
+	if (*mask_str == '~') {
+		invert = true;
+		mask_str++;
+	}
+
+	// XXX: Doesn't support 128-bit masks
+	mask = strtoull(mask_str, &end, 0);
+	// Verify we were able to parse the whole string
+	if (*end != '\0')
+		abort(1, EINVAL, "Unable to apply default mask");
+
+	if (invert)
+		mask = ~mask;
+
+	// Initialize CUDA and the interception callback
+	setup_sm_control_callback();
+
+	// TODO: Switch to memfd_create(); this leaks IPC objects
+	// Create a SysV IPC key (32 bits) to identify our shared memory region
+	// Use the pid as the top 16 bits, and "sm" as the bottom 16
+	shm_key = getpid();
+	shm_key <<= 16;
+	shm_key |= (int)'s' << 8 | (int)'m';
+	// Obtain or create a 128-bit (16-byte) shared memory region
+	shmid = shmget(shm_key, 16, IPC_CREAT | 0600);
+	if (shmid == -1) {
+		abort(0, errno, "Unable to create shared memory for dynamic partition changes. Dynamic changes disabled");
+		g_supreme_sm_mask = &mask;
+		return;
+	}
+	// Open the shared memory region
+	g_supreme_sm_mask = shmat(shmid, NULL, 0);
+	if (g_supreme_sm_mask == (void*)-1) {
+		abort(0, errno, "Unable to create shared memory for dynamic partition changes. Dynamic changes disabled");
+		g_supreme_sm_mask = &mask;
+		return;
+	}
+	// XXX: This makes the region unopenable to everyone else. Switch to memfd!
+	// Mark the shared memory region for deletion (after we terminate)
+	if (shmctl(shmid, IPC_RMID, NULL) == -1)
+		abort(0, errno, "Unable to mark shared memory for dynamic partition changes for deletion on process termination. Will leak one page of memory.");
+
+	// Set the super-global mask which cannot be overwritten by any libsmctrl
+	// API function.
+	*g_supreme_sm_mask = mask;
+}

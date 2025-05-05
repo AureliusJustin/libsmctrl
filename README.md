@@ -103,6 +103,7 @@ make tests
 - Untested on non-Jetson `aarch64` platforms
 - Untested on CUDA 11.8, 12.0, and 12.1 on Jetson `aarch64`
 - Mask bit indexes do not directly correlate to software-visible TPC/SM IDs in V4 TMD/QMDs (Hopper+; compute capability 9.0). The mask bit indexes instead appear to correspond to on-chip-units, including disabled ones; i.e. the set of pre-SM-ID-remapping and pre-floorsweeping TPCs
+- Tests fail when NVIDIA MPS is enabled on Volta-generation and newer GPUs, as non-physical SM IDs are returned by `%%smid` register in this configuration (see US Patent 11,307,903 by NVIDIA)
 
 ## Important Limitations
 
