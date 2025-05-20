@@ -134,7 +134,7 @@ int main(int argc, char **argv) {
 		}
 		// Tell loader to initialize libsmctrl.so first
 		// TODO: Append, rather than overwrite LD_PRELOAD
-		setenv("LD_PRELOAD", "./libsmctrl.so", 1);
+		setenv("LD_PRELOAD", "libsmctrl.so", 1);
 		// Explictly set the number of channels, otherwise CUDA will only use two
 		// (see paper for why that causes problems)
 		setenv("CUDA_DEVICE_MAX_CONNECTIONS", "8", 1);
