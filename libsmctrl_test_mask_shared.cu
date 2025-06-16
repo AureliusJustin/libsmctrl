@@ -18,9 +18,8 @@ __global__ void read_and_store_smid(uint8_t* smid_arr) {
   smid_arr[blockIdx.x] = smid;
 }
 
-// Assuming SMs continue to support a maximum of 2048 resident threads, six
-// blocks of 1024 threads should span at least three SMs without partitioning
-#define NUM_BLOCKS 142 //6
+// Need at least as many blocks as there are SMs on NVIDIA's biggest GPUs
+#define NUM_BLOCKS 142
 
 static int sort_asc(const void* a, const void* b) {
   return *(uint8_t*)a - *(uint8_t*)b;
@@ -83,8 +82,11 @@ int test_constrained_size_and_location(enum partitioning_type part_type) {
     // Apply partitioning to enable only the first TPC of each 32-bit block
     switch (part_type) {
       case PARTITION_SUPREME:
-        printf("%s: Please set mask to '0x%016lx%016lx' for PID %d using the control deamon and press any key to continue...\n", program_invocation_name, (uint64_t)(mask >> 64), (uint64_t)mask, getpid());
-        fgetc(stdin);
+        char cmd[80];
+        // We must invert the mask before passing it to nvtaskset, since
+        // nvtaskset takes an enable mask (as with the taskset command)
+        snprintf(cmd, 80, "./nvtaskset -p 0x%.0lx%016lx %d > /dev/null", ~(uint64_t)(mask >> 64), ~(uint64_t)mask, getpid());
+        system(cmd);
         break;
       case PARTITION_GLOBAL:
         libsmctrl_set_global_mask(mask);
@@ -120,10 +122,9 @@ int test_constrained_size_and_location(enum partitioning_type part_type) {
     uniq_partitioned = count_unique(smids_partitioned_h, NUM_BLOCKS); // Sorts too
     if (uniq_partitioned > sms_per_tpc) {
       printf("%s: ***Test failure.***\n"
-             "%s: Reason: With TPC mask set to "
-             "constrain all kernels to a single TPC, a kernel of %d blocks of "
-             "1024 threads was launched and found to run on %d SMs (at most %d---"
-             "one TPC---expected).\n", program_invocation_name, program_invocation_name, NUM_BLOCKS, uniq_partitioned, sms_per_tpc);
+             "%s: Reason: With a partition of only one TPC, the test kernel "
+             "of %d blocks of 1024 threads ran on %d SMs (at most %d---one "
+             "TPC---expected).\n", program_invocation_name, program_invocation_name, NUM_BLOCKS, uniq_partitioned, sms_per_tpc);
       return 1;
     }
 
@@ -131,18 +132,16 @@ int test_constrained_size_and_location(enum partitioning_type part_type) {
     if (smids_partitioned_h[NUM_BLOCKS - 1] > (enabled_tpc * sms_per_tpc) + sms_per_tpc - 1 ||
         smids_partitioned_h[NUM_BLOCKS - 1] < (enabled_tpc * sms_per_tpc)) {
       printf("%s: ***Test failure.***\n"
-             "%s: Reason: With TPC mask set to "
-             "constrain all kernels to TPC %d, a kernel was run and found "
-             "to run on an SM IDs: as high as %d and as low as %d (range of %d to %d expected).\n",
-             program_invocation_name, program_invocation_name, enabled_tpc, smids_partitioned_h[NUM_BLOCKS - 1], smids_partitioned_h[0], enabled_tpc * sms_per_tpc + sms_per_tpc - 1, enabled_tpc * sms_per_tpc);
+             "%s: Reason: With a partition of only TPC %d, the test kernel "
+             "ran on SM IDs as high as %d and as low as %d (range of %d to %d "
+             "expected).\n", program_invocation_name, program_invocation_name, enabled_tpc, smids_partitioned_h[NUM_BLOCKS - 1], smids_partitioned_h[0], enabled_tpc * sms_per_tpc + sms_per_tpc - 1, enabled_tpc * sms_per_tpc);
       return 1;
     }
 
     // Div by 32 via a shift
     asprintf(&reason[enabled_tpc >> 5],
-         "With a partition enabled which "
-         "contained only TPC ID %d, the test kernel was found to use only %d "
-         "SMs (%d without), and all SMs in-use had IDs between %d and %d (were contained"
+         "With a partition of only TPC %d, the test kernel used only %d "
+         "SMs (%d without), and all had IDs between %d and %d (were contained"
          " in TPC %d).", enabled_tpc, uniq_partitioned, uniq_native, smids_partitioned_h[0], smids_partitioned_h[NUM_BLOCKS - 1], enabled_tpc);
   }
 

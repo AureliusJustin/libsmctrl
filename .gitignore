@@ -8,6 +8,8 @@ libsmctrl_test_stream_mask
 libsmctrl_test_stream_mask_override
 libsmctrl_test_next_mask
 libsmctrl_test_next_mask_override
+libcuda.so.1
+nvtaskset
 *.pyc
 *.o
 .gdb_history

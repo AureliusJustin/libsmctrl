@@ -38,6 +38,8 @@ int main(int argc, char** argv) {
 		gpu_id = 0;
 	// Tell CUDA to use PCI device id ordering (to match nvdebug)
 	putenv((char*)"CUDA_DEVICE_ORDER=PCI_BUS_ID");
+	// Allow CUDA to see all devices (to better match nvdebug)
+	unsetenv("CUDA_VISIBLE_DEVICES");
 	// A CUDA context is required before reading the topology information
 	if ((res = cuInit(0))) {
 		const char* name;
@@ -45,7 +47,7 @@ int main(int argc, char** argv) {
 		fprintf(stderr, "%s: Unable to initialize CUDA, error %s\n", program_invocation_name, name);
 		return 1;
 	}
-	if ((res = cuCtxCreate(&ctx, 0, 0))) {
+	if ((res = cuCtxCreate(&ctx, 0, gpu_id))) {
 		const char* name;
 		cuGetErrorName(res, &name);
 		fprintf(stderr, "%s: Unable to create a CUDA context, error %s\n", program_invocation_name, name);

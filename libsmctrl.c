@@ -17,22 +17,27 @@
  * Please contact the authors if support is needed for a particular feature on
  * an older CUDA version. Support for those is unimplemented, not impossible.
  *
- * An old implementation of this file effected the global mask on CUDA 10.2 by
+ * An old implementation of this file affected the global mask on CUDA 10.2 by
  * changing a field in CUDA's global struct that CUDA applies to the QMD/TMD.
  * That implementation was extraordinarily complicated, and was replaced in
  * 2024 with a more-backward-compatible way of hooking the TMD/QMD.
  * View the old implementation via Git: `git show aa63a02e:libsmctrl.c`.
  */
+#define _GNU_SOURCE // To enable use of memfd_create()
 #include <cuda.h>
 
 #include <errno.h>
 #include <error.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <sys/ipc.h>
-#include <sys/shm.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include "libsmctrl.h"
@@ -48,20 +53,33 @@
 // (No testing attempted on pre-CUDA-6.5 versions)
 // Values for the following three lines can be extracted by tracing CUPTI as
 // it interects with libcuda.so to set callbacks.
-static const CUuuid callback_funcs_id = {0x2c, (char)0x8e, 0x0a, (char)0xd8, 0x07, 0x10, (char)0xab, 0x4e, (char)0x90, (char)0xdd, 0x54, 0x71, (char)0x9f, (char)0xe5, (char)0xf7, 0x4b};
+static const CUuuid callback_funcs_id = {{0x2c, (char)0x8e, 0x0a, (char)0xd8, 0x07, 0x10, (char)0xab, 0x4e, (char)0x90, (char)0xdd, 0x54, 0x71, (char)0x9f, (char)0xe5, (char)0xf7, 0x4b}};
 // These callback descriptors appear to intercept the TMD/QMD late enough that
 // CUDA has already applied the per-stream mask from its internal data
 // structures, allowing us to override it with the next mask.
 #define QMD_DOMAIN 0xb
 #define QMD_PRE_UPLOAD 0x1
+/**
+ * These globals must be non-static (i.e., have global linkage) to ensure that
+ * if multiple copies of the library are loaded (e.g., dynamically linked to
+ * both this program and a dependency), secondary copies do not attempt to
+ * repeat initialization or make changes to unused copies of mask values.
+ */
 // Supreme mask (cannot be overridden)
-static uint64_t *g_supreme_sm_mask = NULL;
+uint128_t *g_supreme_sm_mask = NULL;
 // Global mask (applies across all threads)
-static uint64_t g_sm_mask = 0;
+uint64_t g_sm_mask = 0;
 // Next mask (applies per-thread)
-static __thread uint64_t g_next_sm_mask = 0;
+__thread uint64_t g_next_sm_mask = 0;
 // Flag value to indicate if setup has been completed
-static bool sm_control_setup_called = false;
+bool sm_control_setup_called = false;
+
+#ifdef LIBSMCTRL_STATIC
+// Special handling for if built as a static library, and the libcuda.so.1
+// libsmctrl wrapper is in use (see comment on setup() constructor for detail).
+static void (*shared_set_global_mask)(uint64_t) = NULL;
+static void (*shared_set_next_mask)(uint64_t) = NULL;
+#endif
 
 // v1 has been removed---it intercepted the TMD/QMD too early, making it
 // impossible to override the CUDA-injected stream mask with the next mask.
@@ -78,7 +96,7 @@ static void control_callback_v2(void *ukwn, int domain, int cbid, const void *in
 	if (!tmd)
 		abort(1, 0, "TMD allocation appears NULL; likely forward-compatibilty issue.\n");
 
-	uint32_t *lower_ptr, *upper_ptr;
+	uint32_t *lower_ptr, *upper_ptr, *ext_lower_ptr, *ext_upper_ptr;
 
 	// The location of the TMD version field seems consistent across versions
 	uint8_t tmd_ver = *(uint8_t*)(tmd + 72);
@@ -87,10 +105,12 @@ static void control_callback_v2(void *ukwn, int domain, int cbid, const void *in
 		// TMD V04_00 is used starting with Hopper to support masking >64 TPCs
 		lower_ptr = tmd + 304;
 		upper_ptr = tmd + 308;
+		ext_lower_ptr = tmd + 312;
+		ext_upper_ptr = tmd + 316;
 		// XXX: Disable upper 64 TPCs until we have ...next_mask_ext and
 		//      ...global_mask_ext
-		*(uint32_t*)(tmd + 312) = -1;
-		*(uint32_t*)(tmd + 316) = -1;
+		*ext_lower_ptr = -1;
+		*ext_upper_ptr = -1;
 		// An enable bit is also required
 		*(uint32_t*)tmd |= 0x80000000;
 	} else if (tmd_ver >= 0x16) {
@@ -119,6 +139,10 @@ static void control_callback_v2(void *ukwn, int domain, int cbid, const void *in
 	if (g_supreme_sm_mask) {
 		*lower_ptr |= (uint32_t)*g_supreme_sm_mask;
 		*upper_ptr |= (uint32_t)(*g_supreme_sm_mask >> 32);
+		if (tmd_ver >= 0x40) {
+			*ext_lower_ptr |= (uint32_t)(*g_supreme_sm_mask >> 64);
+			*ext_upper_ptr |= (uint32_t)(*g_supreme_sm_mask >> 96);
+		}
 	}
 
 	//fprintf(stderr, "Final SM Mask (lower): %x\n", *lower_ptr);
@@ -163,12 +187,26 @@ static void setup_sm_control_callback() {
 
 // Set default mask for all launches
 void libsmctrl_set_global_mask(uint64_t mask) {
+#ifdef LIBSMCTRL_STATIC
+	// Special handling for if built as a static library, and the libcuda.so.1
+	// libsmctrl wrapper is in use (see comment on setup() constructor for
+	// detail).
+	if (shared_set_global_mask)
+		return (*shared_set_global_mask)(mask);
+#endif
 	setup_sm_control_callback();
 	g_sm_mask = mask;
 }
 
 // Set mask for next launch from this thread
 void libsmctrl_set_next_mask(uint64_t mask) {
+#ifdef LIBSMCTRL_STATIC
+	// Special handling for if built as a static library, and the libcuda.so.1
+	// libsmctrl wrapper is in use (see comment on setup() constructor for
+	// detail).
+	if (shared_set_next_mask)
+		return (*shared_set_next_mask)(mask);
+#endif
 	setup_sm_control_callback();
 	g_next_sm_mask = mask;
 }
@@ -248,7 +286,7 @@ struct stream_sm_mask_v2 {
 // (CUDA 9.0 behaves slightly different on this platform.)
 // @return 1 if detected, 0 if not, -cuda_err on error
 #if __aarch64__
-int detect_parker_soc() {
+static int detect_parker_soc() {
 	int cap_major, cap_minor, err, dev_count;
 	if (err = cuDeviceGetCount(&dev_count))
 		return -err;
@@ -272,7 +310,7 @@ int detect_parker_soc() {
 }
 #endif // __aarch64__
 
-// Should work for CUDA 8.0 through 12.6
+// Should work for CUDA 8.0 through 12.8
 // A cudaStream_t is a CUstream*. We use void* to avoid a cuda.h dependency in
 // our header
 void libsmctrl_set_stream_mask(void* stream, uint64_t mask) {
@@ -417,7 +455,8 @@ void libsmctrl_set_stream_mask_ext(void* stream, uint128_t mask) {
 	}
 }
 
-/* INFORMATIONAL FUNCTIONS */
+
+/*** TPC and GPU Informational Functions ***/
 
 // Read an integer from a file in `/proc`
 static int read_int_procfile(char* filename, uint64_t* out) {
@@ -590,32 +629,98 @@ abort_cuda:
 	return EIO;
 }
 
+
+/*** Private functions for nvtaskset and building as a libcuda.so.1 wrapper ***/
+
+// Check if NVIDIA MPS is running, following the process that `strace` shows
+// `nvidia-cuda-mps-control` to use. MPS is a prerequisite to co-running
+// multiple GPU-using tasks without timeslicing.
+bool libsmctrl_is_mps_running() {
+	char *mps_pipe_dir;
+	int mps_ctrl;
+	struct sockaddr_un mps_ctrl_addr;
+	mps_ctrl_addr.sun_family = AF_UNIX;
+	const int yes = 1;
+
+	if (!(mps_pipe_dir = getenv("CUDA_MPS_PIPE_DIRECTORY")))
+		mps_pipe_dir = "/tmp/nvidia-mps";
+	// Pipe names are limited to 108 characters long
+	snprintf(mps_ctrl_addr.sun_path, 108, "%s/control", mps_pipe_dir);
+	// This mirrors the process `nvidia-cuda-mps-control` uses to detect MPS
+	if ((mps_ctrl = socket(AF_UNIX, SOCK_SEQPACKET, 0)) == -1)
+		return false;
+	if (setsockopt(mps_ctrl, SOL_SOCKET, SO_PASSCRED, &yes, sizeof(yes)) == -1)
+		return false;
+	if (connect(mps_ctrl, &mps_ctrl_addr, sizeof(struct sockaddr_un)) == -1)
+		return false;
+	close(mps_ctrl);
+	return true;
+}
+
+// A variant of strtoul with support for 128-bit integers
+uint128_t strtou128(const char *nptr, char **endptr, int base) {
+	unsigned __int128 result = 0;
+	if (base != 16)
+		error(1, EINVAL, "strtou128 only supports base 16");
+	// Skip a "0x" prefix. Safe due to early evaluation
+	if (*nptr == '0' && (*(nptr + 1) == 'x' || *(nptr + 1) == 'X'))
+		nptr += 2;
+	// Until hitting an invalid character
+	while (1) {
+		if (*nptr >= 'a' && *nptr <= 'f')
+			result = result << 4 | (*nptr - 'a' + 10);
+		else if (*nptr >= 'A' && *nptr <= 'F')
+			result = result << 4 | (*nptr - 'A' + 10);
+		else if (*nptr >= '0' && *nptr <= '9')
+			result = result << 4 | (*nptr - '0');
+		else
+			break;
+		nptr++;
+	}
+	if (endptr)
+		*endptr = (char*)nptr;
+	return result;
+}
+
+#ifdef LIBSMCTRL_WRAPPER
+// The CUDA runtime library uses dlopen() to load CUDA functions from
+// libcuda.so.1. Since we replace that with our wrapper library, we need to
+// also redirect any attempted opens of that shared object to the actual
+// shared library, which is linked to by libcuda.so.
+void *dlopen(const char *filename, int flags) {
+	if (filename && strcmp(filename, "libcuda.so") == 0) {
+		fprintf(stderr, "redirecting dlopen of %s to libcuda.so\n", filename);
+		// A GNU-only dlopen variant
+		return dlmopen(LM_ID_BASE, "libcuda.so", flags);
+	} else
+		return dlmopen(LM_ID_BASE, filename, flags);
+}
+
 // Allow setting a default mask via an environment variable
 // Also enables libsmctrl to be used on unmodified programs via setting:
-//   LD_PRELOAD=libsmctrl.so LIBSMCTRL_MASK=<your mask> ./my_program
+//   LD_LIBRARY_PATH=libsmctrl LIBSMCTRL_MASK=<your mask> ./my_program
 // Where "<your mask>" is replaced with a disable mask, optionally prefixed
 // with a ~ to invert it (make it an enable mask).
 __attribute__((constructor)) static void setup(void) {
 	char *end, *mask_str;
 	// If dynamic changes are disabled (due to an error) this variable is
-	// permanently used to store the supreme mask, rather than the SysV shared
+	// permanently used to store the supreme mask, rather than the shared
 	// memory segment.
-	static uint64_t mask;
+	static uint128_t mask;
 	bool invert = false;
-	int shmid;
-	key_t shm_key;
 
 	mask_str = getenv("LIBSMCTRL_MASK");
+
+	// Assume no mask if unspecified
 	if (!mask_str)
-		return;
+		mask_str = "0";
 
 	if (*mask_str == '~') {
 		invert = true;
 		mask_str++;
 	}
 
-	// XXX: Doesn't support 128-bit masks
-	mask = strtoull(mask_str, &end, 0);
+	mask = strtou128(mask_str, &end, 16);
 	// Verify we were able to parse the whole string
 	if (*end != '\0')
 		abort(1, EINVAL, "Unable to apply default mask");
@@ -623,35 +728,64 @@ __attribute__((constructor)) static void setup(void) {
 	if (invert)
 		mask = ~mask;
 
+	// Explictly set the number of channels (if unset), otherwise CUDA will only
+	// use two with MPS (see paper for why that causes problems)
+	if (setenv("CUDA_DEVICE_MAX_CONNECTIONS", "8", 0) == -1)
+		abort(1, EINVAL, "Unable to configure environment");
+
+	// Warn if a mask was specified but MPS isn't running
+	if (mask && !libsmctrl_is_mps_running())
+		fprintf(stderr, "libsmctrl-libcuda-wrapper: Warning: TPC mask set via LIBSMCTRL_MASK, but NVIDIA MPS is not running. CUDA programs will not co-run!\n");
+
 	// Initialize CUDA and the interception callback
 	setup_sm_control_callback();
 
-	// TODO: Switch to memfd_create(); this leaks IPC objects
-	// Create a SysV IPC key (32 bits) to identify our shared memory region
-	// Use the pid as the top 16 bits, and "sm" as the bottom 16
-	shm_key = getpid();
-	shm_key <<= 16;
-	shm_key |= (int)'s' << 8 | (int)'m';
-	// Obtain or create a 128-bit (16-byte) shared memory region
-	shmid = shmget(shm_key, 16, IPC_CREAT | 0600);
-	if (shmid == -1) {
+	// Create shared memory region for the supreme mask such that nvtaskset
+	// can read and modify it
+	int fd = memfd_create("libsmctrl", MFD_CLOEXEC);
+	if (fd == -1) {
 		abort(0, errno, "Unable to create shared memory for dynamic partition changes. Dynamic changes disabled");
 		g_supreme_sm_mask = &mask;
 		return;
 	}
-	// Open the shared memory region
-	g_supreme_sm_mask = shmat(shmid, NULL, 0);
-	if (g_supreme_sm_mask == (void*)-1) {
-		abort(0, errno, "Unable to create shared memory for dynamic partition changes. Dynamic changes disabled");
+	if (ftruncate(fd, 16) == -1) {
+		abort(0, errno, "Unable to resize shared memory for dynamic partition changes. Dynamic changes disabled");
 		g_supreme_sm_mask = &mask;
 		return;
 	}
-	// XXX: This makes the region unopenable to everyone else. Switch to memfd!
-	// Mark the shared memory region for deletion (after we terminate)
-	if (shmctl(shmid, IPC_RMID, NULL) == -1)
-		abort(0, errno, "Unable to mark shared memory for dynamic partition changes for deletion on process termination. Will leak one page of memory.");
+	if ((g_supreme_sm_mask = mmap(NULL, 16, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)) == MAP_FAILED) {
+		abort(0, errno, "Unable to map shared memory for dynamic partition changes. Dynamic changes disabled");
+		g_supreme_sm_mask = &mask;
+		return;
+	}
 
 	// Set the super-global mask which cannot be overwritten by any libsmctrl
 	// API function.
 	*g_supreme_sm_mask = mask;
 }
+#elif defined(LIBSMCTRL_STATIC)
+// If this library is statically built into a program, and the libcuda.so.1
+// wrapper is enabled, we force the staticlly linked version of the library
+// to defer to the function implementations in the wrapper.
+//
+// Longer explanation:
+// If the library has been dynamically linked into a program and the wrapper
+// is in use, the loader will point both to the same set of symbols (since both
+// will do a dynamic lookup at load-time, the global state at the top of this
+// file uses global linkage, and will thus be in the dynamic symbol table, and
+// each lookup will find the same copy.)
+// Symbols from a staticlly linked library are not included in the dynamic
+// symbol table, and thus can exist in duplicate of those in any shared
+// library. This is a problem, since only one callback function, using one set
+// of global variables can be registered with CUDA. We work around this by
+// having our statically linked library use the functions from the wrapper or
+// any shared library, if one such instance is loaded.
+__attribute__((constructor)) static void setup(void) {
+	// dlsym can only view the dynamic symbol tables, and so these lookups will
+	// fail if neither the wrapper (libcuda.so.1) nor libsmctrl.so are loaded.
+	// (That indicates that we should the static library implementations.)
+	// These are a NOP on failure since they return NULL when not found.
+	shared_set_next_mask = dlsym(RTLD_DEFAULT, "libsmctrl_set_next_mask");
+	shared_set_global_mask = dlsym(RTLD_DEFAULT, "libsmctrl_set_global_mask");
+}
+#endif
