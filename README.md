@@ -91,7 +91,7 @@ The resultant `benchmark` binary should be portable to any system with an equiva
 As an alternative to modifying your application, `libsmctrl` can be installed system-wide, and partitions for each application can be set via the `nvtaskset` tool.
 The `nvtaskset` tool works very similarly to the Linux CPU-affinity-setting tool `taskset`.
 
-To install `libsmctrl` system-wide, such that all CUDA-using applications automatically load it, ensure that `patchelf` is installed (`sudo apt install patchelf`), and run:
+To install `libsmctrl` system-wide, such that all CUDA-using applications automatically load it, run:
 ```
 make libcuda.so.1 install
 ```

@@ -22,7 +22,9 @@ libsmctrl.a: libsmctrl.c libsmctrl.h
 # ----- CUDA Wrapper -----
 libcuda.so.1: libsmctrl.c libsmctrl.h
 	$(CC) $< -shared -o $@ -fPIC -DLIBSMCTRL_WRAPPER $(CFLAGS) $(LDFLAGS)
-	patchelf libcuda.so.1 --add-needed libcuda.so
+	@# Replace dynamic symbol dependency on libcuda.so.1 with libcuda.so
+	@# Could also be done via patchelf --replace-needed libcuda.so.1 libcuda.so libcuda.so.1
+	sed -i "s/libcuda.so.1\x00/libcuda.so\x00\x00\x00/g" libcuda.so.1
 
 # ----- Utilities -----
 # Use static linking with tests to avoid LD_LIBRARY_PATH issues
@@ -71,20 +73,20 @@ clean:
 
 install: libcuda.so.1
 	@# Check that CUDA is installed first
-	test -f /lib/$(ARCH)/libcuda.so.*.*
+	test -f /usr/lib/$(ARCH)/libcuda.so.*.*
 	@# Change libcuda.so link to bypass libcuda.so.1
-	sudo ln -sf /lib/$(ARCH)/libcuda.so.*.* /lib/$(ARCH)/libcuda.so
+	sudo ln -sf /usr/lib/$(ARCH)/libcuda.so.*.* /usr/lib/$(ARCH)/libcuda.so
 	@# Remove libcuda.so.1 symlink
-	sudo rm /lib/$(ARCH)/libcuda.so.1
+	sudo rm /usr/lib/$(ARCH)/libcuda.so.1
 	@# Install wrapper as libcuda.so.1
-	sudo cp libcuda.so.1 /lib/$(ARCH)/libcuda.so.1
+	sudo cp libcuda.so.1 /usr/lib/$(ARCH)/libcuda.so.1
 
 remove:
 	@# Test that our library in installed first
-	test ! -L /lib/$(ARCH)/libcuda.so.1
+	test ! -L /usr/lib/$(ARCH)/libcuda.so.1
 	@# Overwrite install with original symlinks
-	sudo ln -sf libcuda.so.1 /lib/$(ARCH)/libcuda.so
-	sudo ln -sf /lib/$(ARCH)/libcuda.so.*.* /lib/$(ARCH)/libcuda.so.1
+	sudo ln -sf libcuda.so.1 /usr/lib/$(ARCH)/libcuda.so
+	sudo ln -sf /usr/lib/$(ARCH)/libcuda.so.*.* /usr/lib/$(ARCH)/libcuda.so.1
 
 run_tests: tests
 	./libsmctrl_test_global_mask
