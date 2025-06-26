@@ -582,11 +582,11 @@ int libsmctrl_get_gpc_info_ext(uint32_t* num_enabled_gpcs, uint128_t** tpcs_for_
 int libsmctrl_get_tpc_info(uint32_t* num_tpcs, int dev) {
 	uint32_t num_gpcs;
 	uint128_t* tpcs_per_gpc;
-	int res;
+	int res, gpc;
 	if (res = libsmctrl_get_gpc_info_ext(&num_gpcs, &tpcs_per_gpc, dev))
 		return res;
 	*num_tpcs = 0;
-	for (int gpc = 0; gpc < num_gpcs; gpc++) {
+	for (gpc = 0; gpc < num_gpcs; gpc++) {
 		*num_tpcs += __builtin_popcountl(tpcs_per_gpc[gpc]);
 		*num_tpcs += __builtin_popcountl(tpcs_per_gpc[gpc] >> 64);
 	}
@@ -596,7 +596,7 @@ int libsmctrl_get_tpc_info(uint32_t* num_tpcs, int dev) {
 // @param dev Device index as understood by CUDA **can differ from nvdebug idx**
 // This implementation is fragile, and could be incorrect for odd GPUs
 int libsmctrl_get_tpc_info_cuda(uint32_t* num_tpcs, int cuda_dev) {
-	int num_sms, major, minor, res = 0;
+	int num_sms, sms_per_tpc, major, minor, res = 0;
 	const char* err_str;
 	if (res = cuInit(0))
 		goto abort_cuda;
@@ -611,7 +611,6 @@ int libsmctrl_get_tpc_info_cuda(uint32_t* num_tpcs, int cuda_dev) {
 		return ENOTSUP;
 	// Everything newer than Pascal (as of Hopper) has 2 SMs per TPC, as well
 	// as the P100, which is uniquely sm_60
-	int sms_per_tpc;
 	if (major > 6 || (major == 6 && minor == 0))
 		sms_per_tpc = 2;
 	else
@@ -708,6 +707,7 @@ __attribute__((constructor)) static void setup(void) {
 	// memory segment.
 	static uint128_t mask;
 	bool invert = false;
+	int fd;
 
 	mask_str = getenv("LIBSMCTRL_MASK");
 
@@ -742,7 +742,7 @@ __attribute__((constructor)) static void setup(void) {
 
 	// Create shared memory region for the supreme mask such that nvtaskset
 	// can read and modify it
-	int fd = memfd_create("libsmctrl", MFD_CLOEXEC);
+	fd = memfd_create("libsmctrl", MFD_CLOEXEC);
 	if (fd == -1) {
 		abort(0, errno, "Unable to create shared memory for dynamic partition changes. Dynamic changes disabled");
 		g_supreme_sm_mask = &mask;

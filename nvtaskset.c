@@ -68,6 +68,25 @@ void libsmctrl_get_gpc_info_ext_easy(uint32_t* num_gpcs, uint128_t** masks, int 
 	int res;
 	CUcontext ctx;
 	char *old_order = NULL;
+	int old_stderr, dev_null_fd;
+
+	// Attempt to read the configuration, assuming the GPU is on, and fall
+	// back to creating a context if this fails.
+	// (Creating a CUDA context is very expensive and best avoided)
+	// (Redirect stderr while doing this to mute libsmctrl error messages)
+	if ((dev_null_fd = open("/dev/null", O_WRONLY)) == -1)
+		error(1, errno, "Unable to open /dev/null");
+	if (old_stderr = dup(STDERR_FILENO) == -1)
+		error(1, errno, "Unable to duplicate stderr file descriptor");
+	if (dup2(dev_null_fd, STDERR_FILENO) == -1)
+		error(1, errno, "Unable to overwrite stderr file descriptor");
+	res = libsmctrl_get_gpc_info_ext(num_gpcs, masks, gpu_id);
+	if (dup2(old_stderr, STDERR_FILENO) == -1)
+		error(1, errno, "Unable to restore stderr file descriptor");
+	// End if we were successful, otherwise fallback
+	if (res == 0)
+		return;
+
 	// Tell CUDA to use PCI device id ordering (to match nvdebug)
 	putenv((char*)"CUDA_DEVICE_ORDER=PCI_BUS_ID");
 	// Allow CUDA to see all devices (to better match nvdebug)
@@ -80,12 +99,12 @@ void libsmctrl_get_gpc_info_ext_easy(uint32_t* num_gpcs, uint128_t** masks, int 
 	if ((res = cuInit(0))) {
 		const char* name;
 		cuGetErrorName(res, &name);
-		error(1, 0, "Unable to create a initialize CUDA, error %s\n", name);
+		error(1, 0, "Unable to create a initialize CUDA, error %s", name);
 	}
 	if ((res = cuCtxCreate(&ctx, 0, gpu_id))) {
 		const char* name;
 		cuGetErrorName(res, &name);
-		error(1, 0, "Unable to create a CUDA context, error %s\n", name);
+		error(1, 0, "Unable to create a CUDA context, error %s", name);
 	}
 	// Pull topology information from libsmctrl
 	if ((res = libsmctrl_get_gpc_info_ext(num_gpcs, masks, gpu_id)) != 0) {
@@ -95,6 +114,12 @@ void libsmctrl_get_gpc_info_ext_easy(uint32_t* num_gpcs, uint128_t** masks, int 
 		if (res == EIO)
 			fprintf(stderr, "%s: Is the GPU powered on, i.e., is there an active context?\n", program_invocation_name);
 		exit(1);
+	}
+	// Delete the CUDA context
+	if (res = cuCtxDestroy(ctx)) {
+		const char* name;
+		cuGetErrorName(res, &name);
+		error(1, 0, "Unable to destroy CUDA context, error %s", name);
 	}
 	// Restore the environment (in case we exec() later)
 	unsetenv("CUDA_DEVICE_ORDER");
