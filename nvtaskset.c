@@ -359,16 +359,34 @@ static error_t arg_parser(int key, char* arg, struct argp_state *state){
 				else
 					printf("PID %d's current TPC affinity mask: 0x%.0lx%016lx\n", target_pid, (uint64_t)(enable_mask >> 64), (uint64_t)enable_mask);
 			} else if (is_cmd) {
+				if (!getenv("CUDA_MPS_PIPE_DIRECTORY")) {
+					// Pipe directory is not set by default on L4T aarch64
+					putenv("CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps");
+				}
 				// start MPS (as needed)
 				if (!libsmctrl_is_mps_running()) {
 					fprintf(stderr, "nvtaskset: MPS control deamon does not appear to be running. Automatically starting...\n");
+					// TODO: Mute the error message if this command isn't found?
 					int ret = system("nvidia-cuda-mps-control -d");
+					// TODO: Fall back to full x86_64 install location?
+					// Fall back to full L4T aarch64 install location
+					if (ret == 0x7f00) {
+						// nvidia-cuda-mps-control needs nvidia-cuda-mps-server to be on PATH
+						char *old_path = getenv("PATH");
+						char *new_path;
+						if (old_path)
+							asprintf(&new_path, "PATH=/usr/local/cuda/compat/:%s", old_path);
+						else
+							new_path = "PATH=/usr/local/cuda/compat/";
+						putenv(new_path);
+						ret = system("nvidia-cuda-mps-control -d");
+						// TODO: Put this warning after error checking
+						fprintf(stderr, "nvtaskset: Warning: Set the CUDA_MPS_PIPE_DIRECTORY environment variable to /tmp/nvidia-mps to ensure that subsequently launched tasks associate with MPS on L4T systems!\n");
+					}
 					if (ret == -1)
 						error(1, errno, "Unable to run subshell to start MPS");
-					if (ret == 1) {
-						fprintf(stderr, "nvtaskset: Error starting MPS control deamon. Terminating...\n");
-						return 1;
-					}
+					else if (ret)
+						error(1, 0, "Error starting MPS control deamon. Terminating...");
 					fprintf(stderr, "nvtaskset: Done. Use \"echo quit | nvidia-cuda-mps-control\" to terminate it later as desired.\n");
 				}
 				// launch subprocess
@@ -377,6 +395,7 @@ static error_t arg_parser(int key, char* arg, struct argp_state *state){
 				snprintf(mask_str, 36, "~0x%.0lx%016lx", (uint64_t)(mask >> 64), (uint64_t)mask);
 				setenv("LIBSMCTRL_MASK", mask_str, 1);
 				// Start task
+				// TODO: Check that the loader is configured to find the corrrect libcuda.so.1
 				execvp(sub_argv[0], sub_argv);
 				error(1, errno, "Unable to launch task '%s'", sub_argv[0]);
 			} else {

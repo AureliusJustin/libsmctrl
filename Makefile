@@ -71,22 +71,35 @@ clean:
 	      libsmctrl_test_next_mask libsmctrl_test_next_mask_override \
 	      nvtaskset libcuda.so.1
 
+# On L4T (Linux4Tegra), the paths are different, and there may be multiple copies of libcuda.so.1
 install: libcuda.so.1
-	@# Check that CUDA is installed first
-	test -f /usr/lib/$(ARCH)/libcuda.so.*.*
-	@# Change libcuda.so link to bypass libcuda.so.1
-	sudo ln -sf /usr/lib/$(ARCH)/libcuda.so.*.* /usr/lib/$(ARCH)/libcuda.so
-	@# Remove libcuda.so.1 symlink
-	sudo rm /usr/lib/$(ARCH)/libcuda.so.1
-	@# Install wrapper as libcuda.so.1
-	sudo cp libcuda.so.1 /usr/lib/$(ARCH)/libcuda.so.1
+	@set -e -x; \
+	for DIR in /usr/lib/$(ARCH) /usr/local/cuda-*.*/compat /usr/lib/$(ARCH)/nvidia; do \
+		if [ ! -d $$DIR ]; then continue; fi; \
+		# Check that CUDA is installed in this location \
+		if [ ! -f $$DIR/libcuda.so.*.* ]; then continue; fi; \
+		# Change libcuda.so link to bypass libcuda.so.1 \
+		sudo ln -sf $$DIR/libcuda.so.*.* $$DIR/libcuda.so; \
+		# Remove libcuda.so.1 symlink \
+		sudo rm $$DIR/libcuda.so.1; \
+		# Install wrapper as libcuda.so.1 \
+		sudo cp libcuda.so.1 $$DIR/libcuda.so.1; \
+	done \
+	# Special handling for L4T \
+	if [ -d /usr/lib/$(ARCH)/nvidia ]; then sudo ln -sf nvidia/libcuda.so.1 /usr/lib/$(ARCH)/libcuda.so.1; fi
 
 remove:
-	@# Test that our library in installed first
-	test ! -L /usr/lib/$(ARCH)/libcuda.so.1
-	@# Overwrite install with original symlinks
-	sudo ln -sf libcuda.so.1 /usr/lib/$(ARCH)/libcuda.so
-	sudo ln -sf /usr/lib/$(ARCH)/libcuda.so.*.* /usr/lib/$(ARCH)/libcuda.so.1
+	@set -e -x; \
+	for DIR in /usr/lib/$(ARCH) /usr/local/cuda-*.*/compat /usr/lib/$(ARCH)/nvidia; do \
+		if [ ! -d $$DIR ]; then continue; fi; \
+		# Check that CUDA is installed in this location \
+		if [ ! -f $$DIR/libcuda.so.*.* ]; then continue; fi; \
+		# Test that our library in installed here \
+		if [ -L $$DIR/libcuda.so.1 ]; then continue; fi; \
+		# Overwrite install with original symlinks \
+		sudo ln -sf libcuda.so.1 $$DIR/libcuda.so; \
+		sudo ln -sf $$DIR/libcuda.so.*.* $$DIR/libcuda.so.1; \
+	done
 
 run_tests: tests
 	./libsmctrl_test_global_mask
