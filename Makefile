@@ -7,7 +7,7 @@ LDFLAGS := -ldl -lcuda -I$(CUDA)/include -L$(CUDA)/lib64
 ARCH = $(shell $(CC) -dumpmachine)
 CFLAGS := -Wall -Wno-parentheses
 
-.PHONY: clean tests all install remove run_tests
+.PHONY: clean tests all install remove run_tests lithos_tests run_lithos_tests
 
 # ----- Main Library -----
 libsmctrl.so: libsmctrl.c libsmctrl.h
@@ -20,8 +20,8 @@ libsmctrl.a: libsmctrl.c libsmctrl.h
 	ar rcs $@ libsmctrl.o
 
 # ----- CUDA Wrapper -----
-libcuda.so.1: libsmctrl.c libsmctrl.h
-	$(CC) $< -shared -o $@ -fPIC -DLIBSMCTRL_WRAPPER $(CFLAGS) $(LDFLAGS)
+libcuda.so.1: libsmctrl.c libsmctrl.h lithos_runtime.c lithos_runtime.h
+	$(CC) libsmctrl.c lithos_runtime.c -shared -o $@ -fPIC -DLIBSMCTRL_WRAPPER $(CFLAGS) $(LDFLAGS) -pthread
 	@# Replace dynamic symbol dependency on libcuda.so.1 with libcuda.so
 	@# Could also be done via patchelf --replace-needed libcuda.so.1 libcuda.so libcuda.so.1
 	sed -i "s/libcuda.so.1\x00/libcuda.so\x00\x00\x00/g" libcuda.so.1
@@ -32,6 +32,15 @@ nvtaskset: nvtaskset.c libsmctrl.so libsmctrl.a
 	$(CC) $@.c -o $@ -L. -l:libsmctrl.a $(CFLAGS) $(LDFLAGS)
 
 libsmctrl_test_gpc_info: libsmctrl_test_gpc_info.c libsmctrl.a testbench.h
+	$(CC) $< -o $@ -g -L. -l:libsmctrl.a $(CFLAGS) $(LDFLAGS)
+
+lithos_test_launch_kernelparams: lithos_test_launch_kernelparams.c lithos_test_common.h libcuda.so.1
+	$(CC) $< -o $@ -g $(CFLAGS) $(LDFLAGS)
+
+lithos_test_launch_packed: lithos_test_launch_packed.c lithos_test_common.h libcuda.so.1
+	$(CC) $< -o $@ -g $(CFLAGS) $(LDFLAGS)
+
+lithos_test_scheduler_quota: lithos_test_scheduler_quota.c lithos_test_common.h libsmctrl.a libcuda.so.1
 	$(CC) $< -o $@ -g -L. -l:libsmctrl.a $(CFLAGS) $(LDFLAGS)
 
 # ----- Tests -----
@@ -61,6 +70,8 @@ tests: libsmctrl_test_gpc_info libsmctrl_test_supreme_mask \
        libsmctrl_test_stream_mask_override libsmctrl_test_next_mask \
        libsmctrl_test_next_mask_override
 
+lithos_tests: lithos_test_launch_kernelparams lithos_test_launch_packed lithos_test_scheduler_quota
+
 all: libsmctrl.so libcuda.so.1 nvtaskset tests
 
 clean:
@@ -69,6 +80,8 @@ clean:
 	      libsmctrl_test_global_mask \
 	      libsmctrl_test_stream_mask libsmctrl_test_stream_mask_override \
 	      libsmctrl_test_next_mask libsmctrl_test_next_mask_override \
+	      lithos_test_launch_kernelparams lithos_test_launch_packed \
+	      lithos_test_scheduler_quota \
 	      nvtaskset libcuda.so.1
 
 # On L4T (Linux4Tegra), the paths are different, and there may be multiple copies of libcuda.so.1
@@ -111,3 +124,12 @@ run_tests: tests
 	LD_LIBRARY_PATH=. ./libsmctrl_test_supreme_mask
 	./libsmctrl_test_gpc_info
 	@ echo "All tests passed!"
+
+run_lithos_tests: lithos_tests
+	@# Phase 1 pass-through behavior
+	LD_LIBRARY_PATH=. ./lithos_test_launch_kernelparams
+	@# Phase 2 deferred queue behavior for packed launch args
+	LIBSMCTRL_LITHOS_ENABLE=1 LD_LIBRARY_PATH=. ./lithos_test_launch_packed
+	@# Phase 3 baseline scheduler: 1 TPC quota on first stream
+	LIBSMCTRL_LITHOS_ENABLE=1 LIBSMCTRL_LITHOS_SCHED_ENABLE=1 LIBSMCTRL_LITHOS_TPC_QUOTAS=1 LD_LIBRARY_PATH=. ./lithos_test_scheduler_quota
+	@ echo "All LithOS tests passed!"
