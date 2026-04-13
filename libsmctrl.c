@@ -41,6 +41,7 @@
 #include <unistd.h>
 
 #include "libsmctrl.h"
+#include "lithos_runtime.h"
 
 // In functions that do not return an error code, we favor terminating with an
 // error rather than merely printing a warning and continuing.
@@ -739,6 +740,8 @@ __attribute__((constructor)) static void setup(void) {
 
 	// Initialize CUDA and the interception callback
 	setup_sm_control_callback();
+	// Phase 0/1/2 LithOS runtime init (interposition + deferred launch queue)
+	lithos_wrapper_init();
 
 	// Create shared memory region for the supreme mask such that nvtaskset
 	// can read and modify it
