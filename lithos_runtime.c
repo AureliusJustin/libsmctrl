@@ -16,6 +16,7 @@
 #ifdef LIBSMCTRL_WRAPPER
 
 #include "libsmctrl.h"
+#include "lithos_ipc.h"
 
 #include <cuda.h>
 
@@ -27,6 +28,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
 
 /*** Runtime State ***/
 
@@ -64,6 +68,7 @@ static struct {
 	CUresult (*real_cuLaunchKernel)(CUfunction, unsigned int, unsigned int, unsigned int,
 	                                unsigned int, unsigned int, unsigned int,
 	                                unsigned int, CUstream, void**, void**);
+	CUresult (*real_cuFuncGetParamInfo)(CUfunction, size_t, size_t*, size_t*);
 	CUresult (*real_cuStreamSynchronize)(CUstream);
 	CUresult (*real_cuCtxSynchronize)(void);
 	CUresult (*real_cuStreamQuery)(CUstream);
@@ -84,6 +89,9 @@ static struct {
 	bool oversubscribe_warned;
 	uint32_t quota_list[128];
 	uint32_t quota_count;
+	bool daemon_enabled;
+	bool daemon_warned;
+	char daemon_sock_path[108];
 } g_lithos = {
 	.once = PTHREAD_ONCE_INIT,
 	.initialized = false,
@@ -95,6 +103,7 @@ static struct {
 	.real_cuStreamCreateWithPriority = NULL,
 	.real_cuStreamDestroy = NULL,
 	.real_cuLaunchKernel = NULL,
+	.real_cuFuncGetParamInfo = NULL,
 	.real_cuStreamSynchronize = NULL,
 	.real_cuCtxSynchronize = NULL,
 	.real_cuStreamQuery = NULL,
@@ -113,6 +122,9 @@ static struct {
 	.oversubscribe_warned = false,
 	.quota_list = {0},
 	.quota_count = 0,
+	.daemon_enabled = false,
+	.daemon_warned = false,
+	.daemon_sock_path = {0},
 };
 
 /*** Phase 3 Baseline Scheduler Helpers ***/
@@ -123,6 +135,45 @@ static uint64_t valid_tpc_bits_mask(void) {
 	if (g_lithos.num_tpcs == 0)
 		return 0;
 	return (1ull << g_lithos.num_tpcs) - 1ull;
+}
+
+static uint32_t quota_for_stream_id(uint32_t stream_id) {
+	if (stream_id < g_lithos.quota_count)
+		return g_lithos.quota_list[stream_id];
+	return g_lithos.default_quota;
+}
+
+static bool daemon_rpc(const struct lithosd_req* req, struct lithosd_resp* resp) {
+	int fd;
+	struct sockaddr_un addr;
+	ssize_t n;
+
+	// Best-effort RPC: failures are handled by fallback to unrestricted launches.
+	if (!g_lithos.daemon_enabled || !g_lithos.daemon_sock_path[0])
+		return false;
+
+	fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd == -1)
+		return false;
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sun_family = AF_UNIX;
+	strncpy(addr.sun_path, g_lithos.daemon_sock_path, sizeof(addr.sun_path) - 1);
+	if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
+		close(fd);
+		return false;
+	}
+
+	n = write(fd, req, sizeof(*req));
+	if (n != (ssize_t)sizeof(*req)) {
+		close(fd);
+		return false;
+	}
+	n = read(fd, resp, sizeof(*resp));
+	close(fd);
+	if (n != (ssize_t)sizeof(*resp))
+		return false;
+	return true;
 }
 
 static bool parse_quota_list(const char* s, uint32_t* out, uint32_t* out_count) {
@@ -155,14 +206,40 @@ static bool parse_quota_list(const char* s, uint32_t* out, uint32_t* out_count) 
 }
 
 static void configure_scheduler_from_env(void) {
+	const char* g_en = getenv("LIBSMCTRL_LITHOS_GLOBAL_SCHED_ENABLE");
+	const char* sock = getenv("LIBSMCTRL_LITHOSD_SOCK");
 	const char* en = getenv("LIBSMCTRL_LITHOS_SCHED_ENABLE");
 	const char* q_default = getenv("LIBSMCTRL_LITHOS_TPC_QUOTA_DEFAULT");
 	const char* q_list = getenv("LIBSMCTRL_LITHOS_TPC_QUOTAS");
 	uint32_t tpcs = 0;
 	int rc;
 
-	// Scheduler policy is opt-in so Phase 1/2 behavior remains default.
+	// Scheduler policy is opt-in.
 	g_lithos.scheduler_enabled = false;
+	g_lithos.daemon_enabled = false;
+	g_lithos.daemon_warned = false;
+	g_lithos.daemon_sock_path[0] = '\0';
+	g_lithos.default_quota = 0;
+	g_lithos.quota_count = 0;
+	if (q_default && *q_default)
+		g_lithos.default_quota = (uint32_t)strtoul(q_default, NULL, 10);
+	if (!parse_quota_list(q_list, g_lithos.quota_list, &g_lithos.quota_count)) {
+		fprintf(stderr, "libsmctrl-lithos: scheduler disabled (invalid LIBSMCTRL_LITHOS_TPC_QUOTAS).\n");
+		return;
+	}
+
+	if (g_en && strcmp(g_en, "1") == 0) {
+		if (!sock || !*sock) {
+			fprintf(stderr, "libsmctrl-lithos: global scheduler requested but LIBSMCTRL_LITHOSD_SOCK is unset; falling back to local mode.\n");
+		} else {
+			strncpy(g_lithos.daemon_sock_path, sock, sizeof(g_lithos.daemon_sock_path) - 1);
+			g_lithos.daemon_enabled = true;
+			g_lithos.scheduler_enabled = true;
+			fprintf(stderr, "libsmctrl-lithos: global scheduler mode enabled (socket=%s).\n", g_lithos.daemon_sock_path);
+			return;
+		}
+	}
+
 	if (!en || strcmp(en, "1") != 0)
 		return;
 
@@ -179,17 +256,6 @@ static void configure_scheduler_from_env(void) {
 	}
 	g_lithos.num_tpcs = tpcs;
 
-	if (q_default && *q_default)
-		g_lithos.default_quota = (uint32_t)strtoul(q_default, NULL, 10);
-	else
-		g_lithos.default_quota = 0;
-
-	if (!parse_quota_list(q_list, g_lithos.quota_list, &g_lithos.quota_count)) {
-		fprintf(stderr, "libsmctrl-lithos: scheduler disabled (invalid LIBSMCTRL_LITHOS_TPC_QUOTAS).\n");
-		g_lithos.num_tpcs = 0;
-		return;
-	}
-
 	g_lithos.scheduler_enabled = true;
 	fprintf(stderr,
 	        "libsmctrl-lithos: Phase 3 baseline scheduler enabled (%u TPCs, default quota=%u, explicit quotas=%u).\n",
@@ -200,18 +266,38 @@ static void assign_stream_partition_locked(struct stream_state* st) {
 	uint32_t quota;
 	uint64_t enable_mask;
 	uint64_t valid_mask;
+	struct lithosd_req req;
+	struct lithosd_resp resp;
 	if (!st || !g_lithos.scheduler_enabled)
 		return;
 
-	if (st->stream_id < g_lithos.quota_count)
-		quota = g_lithos.quota_list[st->stream_id];
-	else
-		quota = g_lithos.default_quota;
+	quota = quota_for_stream_id(st->stream_id);
 
 	st->has_partition = false;
 	st->disable_mask = 0;
 	if (quota == 0)
 		return;
+
+	if (g_lithos.daemon_enabled) {
+		memset(&req, 0, sizeof(req));
+		memset(&resp, 0, sizeof(resp));
+		req.op = LITHOSD_OP_ALLOC_STREAM;
+		req.pid = (uint64_t)getpid();
+		req.stream_id = st->stream_id;
+		req.quota = quota;
+		if (!daemon_rpc(&req, &resp)) {
+			if (!g_lithos.daemon_warned) {
+				fprintf(stderr, "libsmctrl-lithos: failed to contact global scheduler daemon; unpartitioned fallback will be used.\n");
+				g_lithos.daemon_warned = true;
+			}
+			return;
+		}
+		if (resp.status == 0 && resp.has_partition) {
+			st->has_partition = true;
+			st->disable_mask = resp.disable_mask;
+		}
+		return;
+	}
 
 	// This baseline policy statically slices TPCs in stream creation order.
 	if (quota > g_lithos.num_tpcs || g_lithos.next_tpc_cursor + quota > g_lithos.num_tpcs) {
@@ -267,6 +353,7 @@ static struct stream_state* get_or_create_stream_state_locked(CUstream stream) {
 	if (!st)
 		return NULL;
 	st->stream = stream;
+	// Stream IDs are process-local and used as stable keys for daemon allocations.
 	st->stream_id = g_lithos.next_stream_id++;
 	assign_stream_partition_locked(st);
 	st->next = g_lithos.streams;
@@ -307,6 +394,55 @@ static bool parse_packed_args(void** extra, void** buf_out, size_t* sz_out) {
 		return false;
 	*buf_out = buf;
 	*sz_out = sz;
+	return true;
+}
+
+// Convert kernelParams (array of pointers to argument values) into the packed
+// launch buffer form so launches can be deferred safely.
+static bool pack_kernel_params(CUfunction f, void** kernelParams, void** packed_out, size_t* packed_size_out) {
+	const size_t max_params = 256;
+	size_t max_end = 0;
+	size_t num_params = 0;
+	void* packed;
+
+	if (!g_lithos.real_cuFuncGetParamInfo || !kernelParams)
+		return false;
+
+	for (size_t i = 0; i < max_params; i++) {
+		size_t off = 0;
+		size_t sz = 0;
+		CUresult res = g_lithos.real_cuFuncGetParamInfo(f, i, &off, &sz);
+		if (res == CUDA_ERROR_INVALID_VALUE)
+			break;
+		if (res != CUDA_SUCCESS)
+			return false;
+		if (!kernelParams[i])
+			return false;
+		if (off + sz > max_end)
+			max_end = off + sz;
+		num_params++;
+	}
+
+	if (num_params == 0 || max_end == 0)
+		return false;
+
+	packed = calloc(1, max_end);
+	if (!packed)
+		return false;
+
+	for (size_t i = 0; i < num_params; i++) {
+		size_t off = 0;
+		size_t sz = 0;
+		CUresult res = g_lithos.real_cuFuncGetParamInfo(f, i, &off, &sz);
+		if (res != CUDA_SUCCESS) {
+			free(packed);
+			return false;
+		}
+		memcpy((char*)packed + off, kernelParams[i], sz);
+	}
+
+	*packed_out = packed;
+	*packed_size_out = max_end;
 	return true;
 }
 
@@ -355,6 +491,7 @@ static void* dispatcher_main(void* arg) {
 		if (st && st->has_partition)
 			libsmctrl_set_next_mask(st->disable_mask);
 
+		// Deferred launches are replayed via packed argument form.
 		void* launch_extra[] = {
 			CU_LAUNCH_PARAM_BUFFER_POINTER,
 			item->arg_buffer,
@@ -375,7 +512,7 @@ static void* dispatcher_main(void* arg) {
 		                           launch_extra);
 
 		pthread_mutex_lock(&g_lithos.mu);
-		st = get_or_create_stream_state_locked(item->stream);
+		st = find_stream_state_locked(item->stream);
 		if (st && st->inflight)
 			st->inflight--;
 		if (res != CUDA_SUCCESS && g_lithos.dispatch_error == CUDA_SUCCESS)
@@ -406,6 +543,7 @@ static void init_real_cuda_once(void) {
 	g_lithos.real_cuStreamCreateWithPriority = resolve_real_symbol("cuStreamCreateWithPriority");
 	g_lithos.real_cuStreamDestroy = resolve_real_symbol("cuStreamDestroy");
 	g_lithos.real_cuLaunchKernel = resolve_real_symbol("cuLaunchKernel");
+	g_lithos.real_cuFuncGetParamInfo = dlsym(g_lithos.real_cuda, "cuFuncGetParamInfo");
 	g_lithos.real_cuStreamSynchronize = resolve_real_symbol("cuStreamSynchronize");
 	g_lithos.real_cuCtxSynchronize = resolve_real_symbol("cuCtxSynchronize");
 	g_lithos.real_cuStreamQuery = resolve_real_symbol("cuStreamQuery");
@@ -419,7 +557,7 @@ static void init_real_cuda_once(void) {
 		return;
 	g_lithos.real_ready = true;
 
-	// Phase 1/2/3 interposition path is opt-in by environment variable.
+	// Interposition path is opt-in by environment variable.
 	const char* en = getenv("LIBSMCTRL_LITHOS_ENABLE");
 	if (!en || strcmp(en, "1") != 0)
 		return;
@@ -432,7 +570,7 @@ static void init_real_cuda_once(void) {
 		return;
 	}
 
-	fprintf(stderr, "libsmctrl-lithos: Phase 2 launch queue runtime enabled.\n");
+	fprintf(stderr, "libsmctrl-lithos: launch queue runtime enabled.\n");
 }
 
 void lithos_wrapper_init(void) {
@@ -527,6 +665,14 @@ CUresult cuStreamDestroy(CUstream hStream) {
 	struct stream_state** pp = &g_lithos.streams;
 	while (*pp) {
 		if ((*pp)->stream == hStream) {
+			if (g_lithos.daemon_enabled) {
+				struct lithosd_req req = {0};
+				struct lithosd_resp resp = {0};
+				req.op = LITHOSD_OP_FREE_STREAM;
+				req.pid = (uint64_t)getpid();
+				req.stream_id = (*pp)->stream_id;
+				(void)daemon_rpc(&req, &resp);
+			}
 			struct stream_state* dead = *pp;
 			*pp = dead->next;
 			free(dead);
@@ -555,27 +701,35 @@ CUresult cuLaunchKernel(CUfunction f,
 	if (!g_lithos.enabled)
 		return direct_launch(f, gx, gy, gz, bx, by, bz, sharedMemBytes, hStream, kernelParams, extra);
 
-	// Deferred queueing currently supports packed launch arguments only.
-	// kernelParams launches are passed through directly.
-	if (kernelParams) {
-		return direct_launch(f, gx, gy, gz, bx, by, bz, sharedMemBytes, hStream, kernelParams, extra);
-	}
-
 	void* arg_buf = NULL;
 	size_t arg_buf_sz = 0;
-	if (!parse_packed_args(extra, &arg_buf, &arg_buf_sz)) {
+	bool arg_buf_owned = false;
+
+	// queue only encodes packed launch arguments; kernelParams are converted.
+	if (kernelParams && !extra) {
+		if (!pack_kernel_params(f, kernelParams, &arg_buf, &arg_buf_sz))
+			return direct_launch(f, gx, gy, gz, bx, by, bz, sharedMemBytes, hStream, kernelParams, extra);
+		arg_buf_owned = true;
+	} else if (!kernelParams && extra) {
+		if (!parse_packed_args(extra, &arg_buf, &arg_buf_sz))
+			return direct_launch(f, gx, gy, gz, bx, by, bz, sharedMemBytes, hStream, kernelParams, extra);
+	} else {
 		return direct_launch(f, gx, gy, gz, bx, by, bz, sharedMemBytes, hStream, kernelParams, extra);
 	}
 
 	struct launch_item* item = calloc(1, sizeof(*item));
 	if (!item)
 		return CUDA_ERROR_OUT_OF_MEMORY;
-	item->arg_buffer = malloc(arg_buf_sz);
-	if (!item->arg_buffer) {
-		free(item);
-		return CUDA_ERROR_OUT_OF_MEMORY;
+	if (arg_buf_owned) {
+		item->arg_buffer = arg_buf;
+	} else {
+		item->arg_buffer = malloc(arg_buf_sz);
+		if (!item->arg_buffer) {
+			free(item);
+			return CUDA_ERROR_OUT_OF_MEMORY;
+		}
+		memcpy(item->arg_buffer, arg_buf, arg_buf_sz);
 	}
-	memcpy(item->arg_buffer, arg_buf, arg_buf_sz);
 	item->arg_buffer_size = arg_buf_sz;
 	item->f = f;
 	item->gx = gx;

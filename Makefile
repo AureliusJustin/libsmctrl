@@ -6,6 +6,7 @@ NVCC ?= $(CUDA)/bin/nvcc
 LDFLAGS := -ldl -lcuda -I$(CUDA)/include -L$(CUDA)/lib64
 ARCH = $(shell $(CC) -dumpmachine)
 CFLAGS := -Wall -Wno-parentheses
+PYTHON ?= python3
 
 .PHONY: clean tests all install remove run_tests lithos_tests run_lithos_tests
 
@@ -31,6 +32,9 @@ libcuda.so.1: libsmctrl.c libsmctrl.h lithos_runtime.c lithos_runtime.h
 nvtaskset: nvtaskset.c libsmctrl.so libsmctrl.a
 	$(CC) $@.c -o $@ -L. -l:libsmctrl.a $(CFLAGS) $(LDFLAGS)
 
+lithosd: lithosd.c lithos_ipc.h
+	$(CC) $< -o $@ -g $(CFLAGS)
+
 libsmctrl_test_gpc_info: libsmctrl_test_gpc_info.c libsmctrl.a testbench.h
 	$(CC) $< -o $@ -g -L. -l:libsmctrl.a $(CFLAGS) $(LDFLAGS)
 
@@ -42,6 +46,21 @@ lithos_test_launch_packed: lithos_test_launch_packed.c lithos_test_common.h libc
 
 lithos_test_scheduler_quota: lithos_test_scheduler_quota.c lithos_test_common.h libsmctrl.a libcuda.so.1
 	$(CC) $< -o $@ -g -L. -l:libsmctrl.a $(CFLAGS) $(LDFLAGS)
+
+lithos_test_kernelparams_scheduler: lithos_test_kernelparams_scheduler.c lithos_test_common.h libsmctrl.a libcuda.so.1
+	$(CC) $< -o $@ -g -L. -l:libsmctrl.a $(CFLAGS) $(LDFLAGS)
+
+lithos_test_arbitrary_app: lithos_test_arbitrary_app.c lithos_test_common.h libsmctrl.a libcuda.so.1
+	$(CC) $< -o $@ -g -L. -l:libsmctrl.a $(CFLAGS) $(LDFLAGS)
+
+lithos_test_terminal_arbitrary: lithos_test_terminal_arbitrary.c lithosd lithos_test_arbitrary_app libsmctrl.a
+	$(CC) $< -o $@ -g -L. -l:libsmctrl.a $(CFLAGS) $(LDFLAGS)
+
+run_lithos_framework_smoke: lithosd lithos_test_framework_smoke.py
+	@SOCK=/tmp/lithosd_fw_smoke_$$PPID.sock; \
+	./lithosd $$SOCK 54 >/tmp/lithosd_fw_smoke.log 2>&1 & D=$$!; \
+	trap 'kill $$D 2>/dev/null; wait $$D 2>/dev/null; rm -f $$SOCK' EXIT INT TERM; \
+	LIBSMCTRL_LITHOS_ENABLE=1 LIBSMCTRL_LITHOS_GLOBAL_SCHED_ENABLE=1 LIBSMCTRL_LITHOSD_SOCK=$$SOCK LD_LIBRARY_PATH=. $(PYTHON) ./lithos_test_framework_smoke.py
 
 # ----- Tests -----
 libsmctrl_test_mask_shared.o: libsmctrl_test_mask_shared.cu testbench.h
@@ -70,7 +89,7 @@ tests: libsmctrl_test_gpc_info libsmctrl_test_supreme_mask \
        libsmctrl_test_stream_mask_override libsmctrl_test_next_mask \
        libsmctrl_test_next_mask_override
 
-lithos_tests: lithos_test_launch_kernelparams lithos_test_launch_packed lithos_test_scheduler_quota
+lithos_tests: lithos_test_launch_kernelparams lithos_test_launch_packed lithos_test_scheduler_quota lithos_test_kernelparams_scheduler lithos_test_arbitrary_app lithos_test_terminal_arbitrary
 
 all: libsmctrl.so libcuda.so.1 nvtaskset tests
 
@@ -81,7 +100,9 @@ clean:
 	      libsmctrl_test_stream_mask libsmctrl_test_stream_mask_override \
 	      libsmctrl_test_next_mask libsmctrl_test_next_mask_override \
 	      lithos_test_launch_kernelparams lithos_test_launch_packed \
-	      lithos_test_scheduler_quota \
+	      lithos_test_scheduler_quota lithos_test_kernelparams_scheduler \
+	      lithos_test_arbitrary_app lithos_test_terminal_arbitrary \
+	      lithosd \
 	      nvtaskset libcuda.so.1
 
 # On L4T (Linux4Tegra), the paths are different, and there may be multiple copies of libcuda.so.1
@@ -132,4 +153,10 @@ run_lithos_tests: lithos_tests
 	LIBSMCTRL_LITHOS_ENABLE=1 LD_LIBRARY_PATH=. ./lithos_test_launch_packed
 	@# Phase 3 baseline scheduler: 1 TPC quota on first stream
 	LIBSMCTRL_LITHOS_ENABLE=1 LIBSMCTRL_LITHOS_SCHED_ENABLE=1 LIBSMCTRL_LITHOS_TPC_QUOTAS=1 LD_LIBRARY_PATH=. ./lithos_test_scheduler_quota
+	@# KernelParams launches should also be deferred/scheduled now
+	LIBSMCTRL_LITHOS_ENABLE=1 LIBSMCTRL_LITHOS_SCHED_ENABLE=1 LIBSMCTRL_LITHOS_TPC_QUOTAS=1 LD_LIBRARY_PATH=. ./lithos_test_kernelparams_scheduler
+	@# Terminal-style arbitrary apps under interposition + daemon
+	LD_LIBRARY_PATH=. ./lithos_test_terminal_arbitrary
+	@# Framework smoke under interposition + daemon (Torch + JAX)
+	$(MAKE) PYTHON=$(PYTHON) run_lithos_framework_smoke
 	@ echo "All LithOS tests passed!"
