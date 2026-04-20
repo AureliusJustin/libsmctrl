@@ -68,6 +68,40 @@ static const char* lithos_test_ptx =
 "    ret;\n"
 "}\n";
 
+static const char* lithos_test_ptx_spin =
+"\n"
+".visible .entry write_smid_spin(\n"
+"    .param .u64 out_ptr,\n"
+"    .param .u64 spin_cycles\n"
+")\n"
+"{\n"
+"    .reg .pred %p<3>;\n"
+"    .reg .b64 %rd<8>;\n"
+"    .reg .b32 %r<4>;\n"
+"\n"
+"    ld.param.u64 %rd1, [out_ptr];\n"
+"    ld.param.u64 %rd6, [spin_cycles];\n"
+"\n"
+"    mov.u32 %r1, %tid.x;\n"
+"    setp.ne.u32 %p1, %r1, 0;\n"
+"    @%p1 bra SMID_SPIN_SKIP_WRITE;\n"
+"    mov.u32 %r2, %ctaid.x;\n"
+"    mul.wide.u32 %rd2, %r2, 4;\n"
+"    add.u64 %rd3, %rd1, %rd2;\n"
+"    mov.u32 %r3, %smid;\n"
+"    st.global.u32 [%rd3], %r3;\n"
+"SMID_SPIN_SKIP_WRITE:\n"
+"\n"
+"    mov.u64 %rd4, %clock64;\n"
+"SPIN_LOOP:\n"
+"    mov.u64 %rd5, %clock64;\n"
+"    sub.u64 %rd7, %rd5, %rd4;\n"
+"    setp.ge.u64 %p2, %rd7, %rd6;\n"
+"    @!%p2 bra SPIN_LOOP;\n"
+"\n"
+"    ret;\n"
+"}\n";
+
 static int count_unique_u32(uint32_t* arr, int len) {
 	int uniq = 0;
 	for (int i = 0; i < len; i++) {
@@ -89,7 +123,21 @@ static void lithos_test_setup(CUcontext* ctx, CUmodule* mod, CUfunction* fn, CUs
 	CHECK_CU(cuInit(0));
 	CHECK_CU(cuDeviceGet(&dev, 0));
 	CHECK_CU(cuCtxCreate(ctx, 0, dev));
-	CHECK_CU(cuModuleLoadData(mod, lithos_test_ptx));
+	{
+		char* merged_ptx;
+		size_t n1 = strlen(lithos_test_ptx);
+		size_t n2 = strlen(lithos_test_ptx_spin);
+		merged_ptx = malloc(n1 + n2 + 1);
+		if (!merged_ptx) {
+			fprintf(stderr, "OOM while preparing PTX module\n");
+			exit(1);
+		}
+		memcpy(merged_ptx, lithos_test_ptx, n1);
+		memcpy(merged_ptx + n1, lithos_test_ptx_spin, n2);
+		merged_ptx[n1 + n2] = '\0';
+		CHECK_CU(cuModuleLoadData(mod, merged_ptx));
+		free(merged_ptx);
+	}
 	CHECK_CU(cuModuleGetFunction(fn, *mod, "write_one"));
 	CHECK_CU(cuStreamCreate(stream, CU_STREAM_DEFAULT));
 }

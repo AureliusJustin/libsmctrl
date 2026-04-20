@@ -5,7 +5,7 @@ NVCC ?= $(CUDA)/bin/nvcc
 # Everything has to have -lcuda, as it's needed for libsmctrl
 LDFLAGS := -ldl -lcuda -I$(CUDA)/include -L$(CUDA)/lib64
 ARCH = $(shell $(CC) -dumpmachine)
-CFLAGS := -Wall -Wno-parentheses
+CFLAGS := -Wall -Wno-parentheses -I. -Ilithos -Ilithos/tests
 PYTHON ?= python3
 
 .PHONY: clean tests all install remove run_tests lithos_tests run_lithos_tests
@@ -21,8 +21,8 @@ libsmctrl.a: libsmctrl.c libsmctrl.h
 	ar rcs $@ libsmctrl.o
 
 # ----- CUDA Wrapper -----
-libcuda.so.1: libsmctrl.c libsmctrl.h lithos_runtime.c lithos_runtime.h
-	$(CC) libsmctrl.c lithos_runtime.c -shared -o $@ -fPIC -DLIBSMCTRL_WRAPPER $(CFLAGS) $(LDFLAGS) -pthread
+libcuda.so.1: libsmctrl.c libsmctrl.h lithos/lithos_runtime.c lithos/lithos_runtime.h
+	$(CC) libsmctrl.c lithos/lithos_runtime.c -shared -o $@ -fPIC -DLIBSMCTRL_WRAPPER $(CFLAGS) $(LDFLAGS) -pthread
 	@# Replace dynamic symbol dependency on libcuda.so.1 with libcuda.so
 	@# Could also be done via patchelf --replace-needed libcuda.so.1 libcuda.so libcuda.so.1
 	sed -i "s/libcuda.so.1\x00/libcuda.so\x00\x00\x00/g" libcuda.so.1
@@ -32,35 +32,35 @@ libcuda.so.1: libsmctrl.c libsmctrl.h lithos_runtime.c lithos_runtime.h
 nvtaskset: nvtaskset.c libsmctrl.so libsmctrl.a
 	$(CC) $@.c -o $@ -L. -l:libsmctrl.a $(CFLAGS) $(LDFLAGS)
 
-lithosd: lithosd.c lithos_ipc.h
+lithosd: lithos/lithosd.c lithos/lithos_ipc.h
 	$(CC) $< -o $@ -g $(CFLAGS)
 
 libsmctrl_test_gpc_info: libsmctrl_test_gpc_info.c libsmctrl.a testbench.h
 	$(CC) $< -o $@ -g -L. -l:libsmctrl.a $(CFLAGS) $(LDFLAGS)
 
-lithos_test_launch_kernelparams: lithos_test_launch_kernelparams.c lithos_test_common.h libcuda.so.1
+lithos_test_launch_kernelparams: lithos/tests/lithos_test_launch_kernelparams.c lithos/tests/lithos_test_common.h libcuda.so.1
 	$(CC) $< -o $@ -g $(CFLAGS) $(LDFLAGS)
 
-lithos_test_launch_packed: lithos_test_launch_packed.c lithos_test_common.h libcuda.so.1
+lithos_test_launch_packed: lithos/tests/lithos_test_launch_packed.c lithos/tests/lithos_test_common.h libcuda.so.1
 	$(CC) $< -o $@ -g $(CFLAGS) $(LDFLAGS)
 
-lithos_test_scheduler_quota: lithos_test_scheduler_quota.c lithos_test_common.h libsmctrl.a libcuda.so.1
+lithos_test_scheduler_quota: lithos/tests/lithos_test_scheduler_quota.c lithos/tests/lithos_test_common.h libsmctrl.a libcuda.so.1
 	$(CC) $< -o $@ -g -L. -l:libsmctrl.a $(CFLAGS) $(LDFLAGS)
 
-lithos_test_kernelparams_scheduler: lithos_test_kernelparams_scheduler.c lithos_test_common.h libsmctrl.a libcuda.so.1
+lithos_test_kernelparams_scheduler: lithos/tests/lithos_test_kernelparams_scheduler.c lithos/tests/lithos_test_common.h libsmctrl.a libcuda.so.1
 	$(CC) $< -o $@ -g -L. -l:libsmctrl.a $(CFLAGS) $(LDFLAGS)
 
-lithos_test_arbitrary_app: lithos_test_arbitrary_app.c lithos_test_common.h libsmctrl.a libcuda.so.1
+lithos_test_arbitrary_app: lithos/tests/lithos_test_arbitrary_app.c lithos/tests/lithos_test_common.h libsmctrl.a libcuda.so.1
 	$(CC) $< -o $@ -g -L. -l:libsmctrl.a $(CFLAGS) $(LDFLAGS)
 
-lithos_test_terminal_arbitrary: lithos_test_terminal_arbitrary.c lithosd lithos_test_arbitrary_app libsmctrl.a
+lithos_test_terminal_arbitrary: lithos/tests/lithos_test_terminal_arbitrary.c lithosd lithos_test_arbitrary_app libsmctrl.a
 	$(CC) $< -o $@ -g -L. -l:libsmctrl.a $(CFLAGS) $(LDFLAGS)
 
-run_lithos_framework_smoke: lithosd lithos_test_framework_smoke.py
+run_lithos_framework_smoke: lithosd lithos/tests/lithos_test_framework_smoke.py lithos/tests/lithos_test_torch_large_mm.py lithos/tests/lithos_test_jax_large_mm.py
 	@SOCK=/tmp/lithosd_fw_smoke_$$PPID.sock; \
 	./lithosd $$SOCK 54 >/tmp/lithosd_fw_smoke.log 2>&1 & D=$$!; \
 	trap 'kill $$D 2>/dev/null; wait $$D 2>/dev/null; rm -f $$SOCK' EXIT INT TERM; \
-	LIBSMCTRL_LITHOS_ENABLE=1 LIBSMCTRL_LITHOS_GLOBAL_SCHED_ENABLE=1 LIBSMCTRL_LITHOSD_SOCK=$$SOCK LD_LIBRARY_PATH=. $(PYTHON) ./lithos_test_framework_smoke.py
+	LIBSMCTRL_LITHOS_ENABLE=1 LIBSMCTRL_LITHOS_GLOBAL_SCHED_ENABLE=1 LIBSMCTRL_LITHOSD_SOCK=$$SOCK LD_LIBRARY_PATH=. $(PYTHON) ./lithos/tests/lithos_test_framework_smoke.py
 
 # ----- Tests -----
 libsmctrl_test_mask_shared.o: libsmctrl_test_mask_shared.cu testbench.h
@@ -147,11 +147,11 @@ run_tests: tests
 	@ echo "All tests passed!"
 
 run_lithos_tests: lithos_tests
-	@# Phase 1 pass-through behavior
+	@# Pass-through behavior
 	LD_LIBRARY_PATH=. ./lithos_test_launch_kernelparams
-	@# Phase 2 deferred queue behavior for packed launch args
+	@# Deferred queue behavior for packed launch args
 	LIBSMCTRL_LITHOS_ENABLE=1 LD_LIBRARY_PATH=. ./lithos_test_launch_packed
-	@# Phase 3 baseline scheduler: 1 TPC quota on first stream
+	@# Baseline scheduler: 1 TPC quota on first stream
 	LIBSMCTRL_LITHOS_ENABLE=1 LIBSMCTRL_LITHOS_SCHED_ENABLE=1 LIBSMCTRL_LITHOS_TPC_QUOTAS=1 LD_LIBRARY_PATH=. ./lithos_test_scheduler_quota
 	@# KernelParams launches should also be deferred/scheduled now
 	LIBSMCTRL_LITHOS_ENABLE=1 LIBSMCTRL_LITHOS_SCHED_ENABLE=1 LIBSMCTRL_LITHOS_TPC_QUOTAS=1 LD_LIBRARY_PATH=. ./lithos_test_kernelparams_scheduler

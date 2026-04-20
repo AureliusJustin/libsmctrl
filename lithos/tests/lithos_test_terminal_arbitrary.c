@@ -2,8 +2,9 @@
  * Terminal-style LithOS global scheduler validation.
  *
  * Launches lithosd and two independent arbitrary apps from the terminal path
- * (exec), with interposition env vars set before process startup. Verifies
- * each app is confined to <= 1 TPC worth of SMs and app SM ranges are disjoint.
+ * (exec), with interposition env vars set before process startup. Uses a
+ * long-running kernel to force overlap so disjointness across concurrent apps
+ * can be validated in launch-level scheduling mode.
  */
 #define _GNU_SOURCE
 
@@ -29,6 +30,16 @@ struct app_result {
 	unsigned min_smid;
 	unsigned max_smid;
 };
+
+struct alloc_snapshot {
+	bool valid;
+	uint64_t pid;
+	uint32_t quota;
+	uint32_t start_tpc;
+	uint64_t disable_mask;
+};
+
+enum { LITHOS_STATUS_SCAN_LIMIT = 4096 };
 
 static int wait_for_socket(const char* sock_path) {
 	struct stat st;
@@ -84,6 +95,76 @@ static int query_active_allocs(const char* sock_path, uint32_t* out_active) {
 	return 0;
 }
 
+static int query_status_row(const char* sock_path, uint32_t idx, struct lithosd_resp* out_resp) {
+	int fd;
+	ssize_t n;
+	struct sockaddr_un addr;
+	struct lithosd_req req = {0};
+	struct lithosd_resp resp = {0};
+
+	fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd == -1)
+		return -1;
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sun_family = AF_UNIX;
+	strncpy(addr.sun_path, sock_path, sizeof(addr.sun_path) - 1);
+	if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
+		close(fd);
+		return -1;
+	}
+
+	req.op = LITHOSD_OP_GET_STATUS;
+	req.reserved = idx;
+	n = write(fd, &req, sizeof(req));
+	if (n != (ssize_t)sizeof(req)) {
+		close(fd);
+		return -1;
+	}
+	n = read(fd, &resp, sizeof(resp));
+	close(fd);
+	if (n != (ssize_t)sizeof(resp) || resp.status != 0)
+		return -1;
+	*out_resp = resp;
+	return 0;
+}
+
+static int snapshot_two_allocs_for_pids(const char* sock_path,
+	                                    pid_t pid_a,
+	                                    pid_t pid_b,
+	                                    struct alloc_snapshot* out_a,
+	                                    struct alloc_snapshot* out_b) {
+	struct lithosd_resp resp;
+
+	memset(out_a, 0, sizeof(*out_a));
+	memset(out_b, 0, sizeof(*out_b));
+
+	for (uint32_t i = 0; i < LITHOS_STATUS_SCAN_LIMIT; i++) {
+		if (query_status_row(sock_path, i, &resp) != 0)
+			return -1;
+		if (!resp.alloc_in_use)
+			continue;
+		if ((pid_t)resp.alloc_pid == pid_a) {
+			out_a->valid = true;
+			out_a->pid = resp.alloc_pid;
+			out_a->quota = resp.alloc_quota;
+			out_a->start_tpc = resp.alloc_start_tpc;
+			out_a->disable_mask = resp.alloc_disable_mask;
+		}
+		if ((pid_t)resp.alloc_pid == pid_b) {
+			out_b->valid = true;
+			out_b->pid = resp.alloc_pid;
+			out_b->quota = resp.alloc_quota;
+			out_b->start_tpc = resp.alloc_start_tpc;
+			out_b->disable_mask = resp.alloc_disable_mask;
+		}
+		if (out_a->valid && out_b->valid)
+			return 0;
+	}
+
+	return 0;
+}
+
 static int spawn_app(const char* sock_path, int* out_fd, pid_t* out_pid) {
 	int pfd[2];
 	pid_t pid;
@@ -105,6 +186,7 @@ static int spawn_app(const char* sock_path, int* out_fd, pid_t* out_pid) {
 		setenv("LIBSMCTRL_LITHOS_GLOBAL_SCHED_ENABLE", "1", 1);
 		setenv("LIBSMCTRL_LITHOS_TPC_QUOTA_DEFAULT", "1", 1);
 		setenv("LIBSMCTRL_LITHOSD_SOCK", sock_path, 1);
+		setenv("LIBSMCTRL_LITHOS_TEST_LONG_KERNEL_CYCLES", "1200000000", 1);
 		unsetenv("LIBSMCTRL_LITHOS_SCHED_ENABLE");
 		setenv("LD_LIBRARY_PATH", ".", 1);
 
@@ -150,6 +232,8 @@ int main(void) {
 	uint32_t num_tpcs = 0;
 	struct app_result a = {0};
 	struct app_result b = {0};
+	struct alloc_snapshot alloc_a = {0};
+	struct alloc_snapshot alloc_b = {0};
 	bool disjoint;
 	uint32_t active_allocs = 0;
 
@@ -185,6 +269,9 @@ int main(void) {
 		unlink(sock_path);
 		return 3;
 	}
+
+	// Best-effort snapshot for diagnostics; allocations may already be reclaimed.
+	(void)snapshot_two_allocs_for_pids(sock_path, app_a_pid, app_b_pid, &alloc_a, &alloc_b);
 
 	if (read_app_result(app_a_fd, &a) != 0 || read_app_result(app_b_fd, &b) != 0) {
 		kill(app_a_pid, SIGTERM);
@@ -224,7 +311,7 @@ int main(void) {
 		return 3;
 	}
 	if (active_allocs != 0) {
-		fprintf(stderr, "Daemon still tracks %u active stream allocations after app teardown\n", active_allocs);
+		fprintf(stderr, "Daemon still tracks %u active launch allocations after app teardown\n", active_allocs);
 		kill(daemon_pid, SIGTERM);
 		waitpid(daemon_pid, NULL, 0);
 		unlink(sock_path);
@@ -247,12 +334,27 @@ int main(void) {
 
 	disjoint = (a.max_smid < b.min_smid) || (b.max_smid < a.min_smid);
 	if (!disjoint) {
-		fprintf(stderr,
-		        "Disjointness failed: appA=[%u,%u], appB=[%u,%u]\n",
-		        a.min_smid,
-		        a.max_smid,
-		        b.min_smid,
-		        b.max_smid);
+		if (alloc_a.valid && alloc_b.valid) {
+			fprintf(stderr,
+			        "Disjointness failed: appA=[%u,%u], appB=[%u,%u], allocA(start=%u,quota=%u,mask=0x%llx), allocB(start=%u,quota=%u,mask=0x%llx)\n",
+			        a.min_smid,
+			        a.max_smid,
+			        b.min_smid,
+			        b.max_smid,
+			        alloc_a.start_tpc,
+			        alloc_a.quota,
+			        (unsigned long long)alloc_a.disable_mask,
+			        alloc_b.start_tpc,
+			        alloc_b.quota,
+			        (unsigned long long)alloc_b.disable_mask);
+		} else {
+			fprintf(stderr,
+			        "Disjointness failed: appA=[%u,%u], appB=[%u,%u] (allocation masks unavailable)\n",
+			        a.min_smid,
+			        a.max_smid,
+			        b.min_smid,
+			        b.max_smid);
+		}
 		return 5;
 	}
 
