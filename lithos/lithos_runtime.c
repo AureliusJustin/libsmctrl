@@ -8,7 +8,7 @@
  */
 #include "lithos_runtime.h"
 
-// #ifdef LIBSMCTRL_WRAPPER
+#ifdef LIBSMCTRL_WRAPPER
 
 #include "libsmctrl.h"
 #include "lithos_ipc.h"
@@ -17,6 +17,7 @@
 
 #include <dlfcn.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -84,6 +85,7 @@ static struct {
 	CUresult (*real_cuCtxSynchronize)(void);
 	CUresult (*real_cuStreamQuery)(CUstream);
 	CUresult (*real_cuStreamIsCapturing)(CUstream, CUstreamCaptureStatus*);
+	CUresult (*real_cuGraphLaunch)(CUgraphExec, CUstream);
 
 	pthread_t dispatcher;
 	pthread_mutex_t mu;
@@ -107,7 +109,8 @@ static struct {
 	bool daemon_warned;
 	bool launch_track_warned;
 	bool capture_bypass_warned;
-	bool capture_passthrough_mode;
+	bool trace_launches;
+	uint64_t trace_seq;
 	char daemon_sock_path[108];
 } g_lithos = {
 	.once = PTHREAD_ONCE_INIT,
@@ -129,6 +132,7 @@ static struct {
 	.real_cuCtxSynchronize = NULL,
 	.real_cuStreamQuery = NULL,
 	.real_cuStreamIsCapturing = NULL,
+	.real_cuGraphLaunch = NULL,
 	.dispatcher = 0,
 	.mu = PTHREAD_MUTEX_INITIALIZER,
 	.cv = PTHREAD_COND_INITIALIZER,
@@ -150,7 +154,8 @@ static struct {
 	.daemon_warned = false,
 	.launch_track_warned = false,
 	.capture_bypass_warned = false,
-	.capture_passthrough_mode = false,
+	.trace_launches = true,
+	.trace_seq = 0,
 	.daemon_sock_path = {0},
 };
 
@@ -389,6 +394,78 @@ static void daemon_free_launch(uint32_t launch_id) {
 static void fail_missing_symbol(const char* sym) {
 	fprintf(stderr, "libsmctrl-lithos: missing CUDA symbol %s; disabling runtime.\n", sym);
 	g_lithos.real_ready = false;
+}
+
+// For tracing and debugging: logs kernel and graph launches with their parameters, partitioning info, and launch result.
+static void trace_kernel_launch(const char* phase,
+                                uint32_t launch_id,
+                                uint32_t stream_id,
+                                CUfunction f,
+                                unsigned int gx,
+                                unsigned int gy,
+                                unsigned int gz,
+                                unsigned int bx,
+                                unsigned int by,
+                                unsigned int bz,
+                                unsigned int shared_mem,
+                                CUstream stream,
+                                bool has_partition,
+                                uint64_t disable_mask,
+                                CUresult result) {
+	uint64_t seq;
+	if (!g_lithos.trace_launches)
+		return;
+	seq = __sync_add_and_fetch(&g_lithos.trace_seq, 1);
+	fprintf(stderr,
+	        "libsmctrl-lithos: trace seq=%" PRIu64
+	        " type=kernel phase=%s launch_id=%u stream_id=%u stream=%p func=%p"
+	        " grid=%ux%ux%u block=%ux%ux%u smem=%u partition=%u mask=0x%016" PRIx64
+	        " result=%d\n",
+	        seq,
+	        phase,
+	        launch_id,
+	        stream_id,
+	        (void*)stream,
+	        (void*)f,
+	        gx,
+	        gy,
+	        gz,
+	        bx,
+	        by,
+	        bz,
+	        shared_mem,
+	        has_partition ? 1u : 0u,
+	        disable_mask,
+	        (int)result);
+}
+
+static void trace_graph_launch(const char* phase,
+	                           uint32_t launch_id,
+	                           uint32_t stream_id,
+	                           CUgraphExec graph_exec,
+	                           CUstream stream,
+	                           bool has_partition,
+	                           uint64_t disable_mask,
+	                           bool tracked_with_event,
+	                           CUresult result) {
+	uint64_t seq;
+	if (!g_lithos.trace_launches)
+		return;
+	seq = __sync_add_and_fetch(&g_lithos.trace_seq, 1);
+	fprintf(stderr,
+	        "libsmctrl-lithos: trace seq=%" PRIu64
+	        " type=graph phase=%s launch_id=%u stream_id=%u stream=%p graph_exec=%p"
+	        " partition=%u mask=0x%016" PRIx64 " tracked_event=%u result=%d\n",
+	        seq,
+	        phase,
+	        launch_id,
+	        stream_id,
+	        (void*)stream,
+	        (void*)graph_exec,
+	        has_partition ? 1u : 0u,
+	        disable_mask,
+	        tracked_with_event ? 1u : 0u,
+	        (int)result);
 }
 
 static void* resolve_real_symbol(const char* name) {
@@ -644,6 +721,23 @@ static void* dispatcher_main(void* arg) {
 		if (has_partition)
 			libsmctrl_set_next_mask(disable_mask);
 
+		// Log Kernel Launch on dispatcher submit
+		trace_kernel_launch("dispatcher-submit",
+		                 item->launch_id,
+		                 item->stream_id,
+		                 item->f,
+		                 item->gx,
+		                 item->gy,
+		                 item->gz,
+		                 item->bx,
+		                 item->by,
+		                 item->bz,
+		                 item->shared_mem,
+		                 item->stream,
+		                 has_partition,
+		                 disable_mask,
+		                 CUDA_SUCCESS);
+
 		// Deferred launches are replayed via packed argument form.
 		void* launch_extra[] = {
 			CU_LAUNCH_PARAM_BUFFER_POINTER,
@@ -674,6 +768,23 @@ static void* dispatcher_main(void* arg) {
 		}
 		if (g_lithos.daemon_enabled && res != CUDA_SUCCESS)
 			daemon_free_launch(item->launch_id);
+
+		// Log Kernel Launch on dispatcher completion
+		trace_kernel_launch("dispatcher-done",
+		                 item->launch_id,
+		                 item->stream_id,
+		                 item->f,
+		                 item->gx,
+		                 item->gy,
+		                 item->gz,
+		                 item->bx,
+		                 item->by,
+		                 item->bz,
+		                 item->shared_mem,
+		                 item->stream,
+		                 has_partition,
+		                 disable_mask,
+		                 res);
 
 		pthread_mutex_lock(&g_lithos.mu);
 		st = find_stream_state_locked(item->stream);
@@ -723,6 +834,7 @@ static void init_real_cuda_once(void) {
 	g_lithos.real_cuCtxSynchronize = resolve_real_symbol("cuCtxSynchronize");
 	g_lithos.real_cuStreamQuery = resolve_real_symbol("cuStreamQuery");
 	g_lithos.real_cuStreamIsCapturing = dlsym(g_lithos.real_cuda, "cuStreamIsCapturing");
+	g_lithos.real_cuGraphLaunch = dlsym(g_lithos.real_cuda, "cuGraphLaunch");
 	if (!g_lithos.real_cuStreamCreate ||
 	    !g_lithos.real_cuStreamCreateWithPriority ||
 	    !g_lithos.real_cuStreamDestroy ||
@@ -735,6 +847,10 @@ static void init_real_cuda_once(void) {
 
 	// Interposition path is opt-in by environment variable.
 	const char* en = getenv("LIBSMCTRL_LITHOS_ENABLE");
+	// Tracing / Logging of launches is enabled by default, but can be disabled by environment variable.
+	const char* trace_en = getenv("LIBSMCTRL_LITHOS_TRACE_LAUNCHES");
+	if (trace_en && strcmp(trace_en, "0") == 0)
+		g_lithos.trace_launches = false;
 	if (!en || strcmp(en, "1") != 0)
 		return;
 	g_lithos.enabled = true;
@@ -872,23 +988,25 @@ CUresult cuLaunchKernel(CUfunction f,
 	lithos_wrapper_init();
 	if (!g_lithos.real_ready || !g_lithos.real_cuLaunchKernel)
 		return CUDA_ERROR_NOT_INITIALIZED;
-	if (!g_lithos.enabled)
+	if (!g_lithos.enabled) {
+		// Log direct launch when lithos runtime is disabled, for visibility in traces.
+		trace_kernel_launch("direct-runtime-disabled", 0, 0, f, gx, gy, gz, bx, by, bz, sharedMemBytes,
+		                 hStream, false, 0, CUDA_SUCCESS);
 		return direct_launch(f, gx, gy, gz, bx, by, bz, sharedMemBytes, hStream, kernelParams, extra);
-	if (g_lithos.capture_passthrough_mode)
-		return direct_launch(f, gx, gy, gz, bx, by, bz, sharedMemBytes, hStream, kernelParams, extra);
+	}
 
-	// CUDA Graph capture requires launch ordering/ownership on the capturing
-	// stream thread. Once observed, force direct launches for process lifetime to
-	// avoid mixing deferred and capture-sensitive execution paths.
-
-	// TODO: Handle CUDA Graph Capture without bypassing the scheduler.
-	if (stream_is_capturing(hStream)) {
-		g_lithos.capture_passthrough_mode = true;
+	// Capture passthrough applies only to launches observed on a capturing stream.
+	bool stream_capturing = stream_is_capturing(hStream);
+	if (stream_capturing) {
 		if (!g_lithos.capture_bypass_warned) {
+			// Passthrough is necessary to avoid deadlock during capture.
 			fprintf(stderr,
-			        "libsmctrl-lithos: CUDA Graph capture detected; switching to process-wide direct launch passthrough.\n");
+			        "libsmctrl-lithos: CUDA Graph capture detected; using direct launch passthrough while capture is active.\n");
 			g_lithos.capture_bypass_warned = true;
 		}
+		// Log direct launch when bypassing for capture (for visibility).
+		trace_kernel_launch("direct-capture-passthrough", 0, 0, f, gx, gy, gz, bx, by, bz,
+		                 sharedMemBytes, hStream, false, 0, CUDA_SUCCESS);
 		return direct_launch(f, gx, gy, gz, bx, by, bz, sharedMemBytes, hStream, kernelParams, extra);
 	}
 
@@ -942,6 +1060,21 @@ CUresult cuLaunchKernel(CUfunction f,
 	}
 	item->stream_id = st->stream_id;
 	item->launch_id = g_lithos.next_launch_id++;
+	trace_kernel_launch("queued",
+	                 item->launch_id,
+	                 item->stream_id,
+	                 item->f,
+	                 item->gx,
+	                 item->gy,
+	                 item->gz,
+	                 item->bx,
+	                 item->by,
+	                 item->bz,
+	                 item->shared_mem,
+	                 item->stream,
+	                 false,
+	                 0,
+	                 CUDA_SUCCESS);
 	st->pending++;
 	if (g_lithos.q_tail)
 		g_lithos.q_tail->next = item;
@@ -1005,4 +1138,102 @@ CUresult cuStreamQuery(CUstream hStream) {
 	return g_lithos.real_cuStreamQuery(hStream);
 }
 
-// #endif
+CUresult cuGraphLaunch(CUgraphExec hGraphExec, CUstream hStream) {
+	bool has_partition = false;
+	uint64_t disable_mask = 0;
+	uint32_t stream_id = 0;
+	uint32_t launch_id = 0;
+	bool daemon_launch_tracked = false;
+	CUevent done_event = NULL;
+	bool tracked_with_event = false;
+
+	lithos_wrapper_init();
+	if (!g_lithos.real_ready || !g_lithos.real_cuGraphLaunch)
+		return CUDA_ERROR_NOT_INITIALIZED;
+	if (!g_lithos.enabled) {
+		trace_graph_launch("direct-runtime-disabled", 0, 0, hGraphExec, hStream, false, 0, false,
+		                CUDA_SUCCESS);
+		return g_lithos.real_cuGraphLaunch(hGraphExec, hStream);
+	}
+
+	// Graph execution launches must stay direct (not queue-deferred), but we can
+	// still apply per-launch partitioning before cuGraphLaunch.
+	pthread_mutex_lock(&g_lithos.mu);
+	struct stream_state* st = get_or_create_stream_state_locked(hStream);
+	if (!st) {
+		pthread_mutex_unlock(&g_lithos.mu);
+		return CUDA_ERROR_OUT_OF_MEMORY;
+	}
+	stream_id = st->stream_id;
+	if (!g_lithos.daemon_enabled && st->has_partition) {
+		has_partition = true;
+		disable_mask = st->disable_mask;
+	}
+	if (g_lithos.daemon_enabled)
+		launch_id = g_lithos.next_launch_id++;
+	pthread_mutex_unlock(&g_lithos.mu);
+
+	if (g_lithos.daemon_enabled) {
+		struct launch_item item;
+		memset(&item, 0, sizeof(item));
+		item.launch_id = launch_id;
+		item.stream_id = stream_id;
+		daemon_launch_tracked = daemon_alloc_launch(&item, &has_partition, &disable_mask);
+	}
+
+	if (has_partition)
+		libsmctrl_set_next_mask(disable_mask);
+
+	// Log Graph Launch on entry to cuGraphLaunch
+	trace_graph_launch("submit",
+	               launch_id,
+	               stream_id,
+	               hGraphExec,
+	               hStream,
+	               has_partition,
+	               disable_mask,
+	               false,
+	               CUDA_SUCCESS);
+
+	CUresult res = g_lithos.real_cuGraphLaunch(hGraphExec, hStream);
+	if (res == CUDA_SUCCESS && g_lithos.daemon_enabled && daemon_launch_tracked &&
+	    g_lithos.real_cuEventCreate && g_lithos.real_cuEventRecord &&
+	    g_lithos.real_cuEventQuery && g_lithos.real_cuEventDestroy) {
+		if (g_lithos.real_cuEventCreate(&done_event, CU_EVENT_DISABLE_TIMING) == CUDA_SUCCESS) {
+			if (g_lithos.real_cuEventRecord(done_event, hStream) == CUDA_SUCCESS)
+				tracked_with_event = true;
+			else
+				(void)g_lithos.real_cuEventDestroy(done_event);
+		}
+	}
+	if (g_lithos.daemon_enabled && daemon_launch_tracked) {
+		if (res != CUDA_SUCCESS || !tracked_with_event)
+			daemon_free_launch(launch_id);
+	}
+
+	if (res == CUDA_SUCCESS && g_lithos.daemon_enabled && daemon_launch_tracked && tracked_with_event) {
+		pthread_mutex_lock(&g_lithos.mu);
+		add_active_launch_locked(launch_id,
+		                       hStream,
+		                       done_event,
+		                       true,
+		                       has_partition,
+		                       disable_mask);
+		pthread_mutex_unlock(&g_lithos.mu);
+	}
+
+	// Log Graph Launch on exit from cuGraphLaunch
+	trace_graph_launch("done",
+	               launch_id,
+	               stream_id,
+	               hGraphExec,
+	               hStream,
+	               has_partition,
+	               disable_mask,
+	               tracked_with_event,
+	               res);
+
+	return res;
+}
+
+#endif
