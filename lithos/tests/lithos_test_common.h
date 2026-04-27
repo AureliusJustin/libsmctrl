@@ -68,6 +68,25 @@ static const char* lithos_test_ptx =
 "    ret;\n"
 "}\n";
 
+static const char* lithos_test_ptx_graph =
+"\n"
+".visible .entry inc_counter(\n"
+"    .param .u64 out_ptr\n"
+")\n"
+"{\n"
+"    .reg .pred %p;\n"
+"    .reg .b64 %rd<2>;\n"
+"    .reg .b32 %r<2>;\n"
+"\n"
+"    ld.param.u64 %rd1, [out_ptr];\n"
+"    mov.u32 %r1, %tid.x;\n"
+"    setp.ne.u32 %p, %r1, 0;\n"
+"    @%p bra INC_DONE;\n"
+"    atom.global.add.u32 %r1, [%rd1], 1;\n"
+"INC_DONE:\n"
+"    ret;\n"
+"}\n";
+
 static const char* lithos_test_ptx_spin =
 "\n"
 ".visible .entry write_smid_spin(\n"
@@ -102,7 +121,7 @@ static const char* lithos_test_ptx_spin =
 "    ret;\n"
 "}\n";
 
-static int count_unique_u32(uint32_t* arr, int len) {
+static int __attribute__((unused)) count_unique_u32(uint32_t* arr, int len) {
 	int uniq = 0;
 	for (int i = 0; i < len; i++) {
 		bool seen = false;
@@ -127,14 +146,16 @@ static void lithos_test_setup(CUcontext* ctx, CUmodule* mod, CUfunction* fn, CUs
 		char* merged_ptx;
 		size_t n1 = strlen(lithos_test_ptx);
 		size_t n2 = strlen(lithos_test_ptx_spin);
-		merged_ptx = malloc(n1 + n2 + 1);
+		size_t n3 = strlen(lithos_test_ptx_graph);
+		merged_ptx = malloc(n1 + n2 + n3 + 1);
 		if (!merged_ptx) {
 			fprintf(stderr, "OOM while preparing PTX module\n");
 			exit(1);
 		}
 		memcpy(merged_ptx, lithos_test_ptx, n1);
 		memcpy(merged_ptx + n1, lithos_test_ptx_spin, n2);
-		merged_ptx[n1 + n2] = '\0';
+		memcpy(merged_ptx + n1 + n2, lithos_test_ptx_graph, n3);
+		merged_ptx[n1 + n2 + n3] = '\0';
 		CHECK_CU(cuModuleLoadData(mod, merged_ptx));
 		free(merged_ptx);
 	}

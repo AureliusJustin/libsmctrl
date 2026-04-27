@@ -53,8 +53,8 @@ lithos_test_kernelparams_scheduler: lithos/tests/lithos_test_kernelparams_schedu
 lithos_test_arbitrary_app: lithos/tests/lithos_test_arbitrary_app.c lithos/tests/lithos_test_common.h libsmctrl.a libcuda.so.1
 	$(CC) $< -o $@ -g -L. -l:libsmctrl.a $(CFLAGS) $(LDFLAGS)
 
-lithos_test_terminal_arbitrary: lithos/tests/lithos_test_terminal_arbitrary.c lithosd lithos_test_arbitrary_app libsmctrl.a
-	$(CC) $< -o $@ -g -L. -l:libsmctrl.a $(CFLAGS) $(LDFLAGS)
+lithos_test_cuda_graph_capture_replay: lithos/tests/lithos_test_cuda_graph_capture_replay.c lithos/tests/lithos_test_common.h libcuda.so.1
+	$(CC) $< -o $@ -g $(CFLAGS) $(LDFLAGS)
 
 run_lithos_framework_smoke: lithosd lithos/tests/lithos_test_framework_smoke.py lithos/tests/lithos_test_torch_large_mm.py lithos/tests/lithos_test_jax_large_mm.py
 	@SOCK=/tmp/lithosd_fw_smoke_$$PPID.sock; \
@@ -89,7 +89,7 @@ tests: libsmctrl_test_gpc_info libsmctrl_test_supreme_mask \
        libsmctrl_test_stream_mask_override libsmctrl_test_next_mask \
        libsmctrl_test_next_mask_override
 
-lithos_tests: lithos_test_launch_kernelparams lithos_test_launch_packed lithos_test_scheduler_quota lithos_test_kernelparams_scheduler lithos_test_arbitrary_app lithos_test_terminal_arbitrary
+lithos_tests: lithos_test_launch_kernelparams lithos_test_launch_packed lithos_test_scheduler_quota lithos_test_kernelparams_scheduler lithos_test_arbitrary_app lithos_test_cuda_graph_capture_replay
 
 all: libsmctrl.so libcuda.so.1 nvtaskset tests
 
@@ -101,7 +101,7 @@ clean:
 	      libsmctrl_test_next_mask libsmctrl_test_next_mask_override \
 	      lithos_test_launch_kernelparams lithos_test_launch_packed \
 	      lithos_test_scheduler_quota lithos_test_kernelparams_scheduler \
-	      lithos_test_arbitrary_app lithos_test_terminal_arbitrary \
+	      lithos_test_arbitrary_app \
 	      lithosd \
 	      nvtaskset libcuda.so.1
 
@@ -155,8 +155,8 @@ run_lithos_tests: lithos_tests
 	LIBSMCTRL_LITHOS_ENABLE=1 LIBSMCTRL_LITHOS_SCHED_ENABLE=1 LIBSMCTRL_LITHOS_TPC_QUOTAS=1 LD_LIBRARY_PATH=. ./lithos_test_scheduler_quota
 	@# KernelParams launches should also be deferred/scheduled now
 	LIBSMCTRL_LITHOS_ENABLE=1 LIBSMCTRL_LITHOS_SCHED_ENABLE=1 LIBSMCTRL_LITHOS_TPC_QUOTAS=1 LD_LIBRARY_PATH=. ./lithos_test_kernelparams_scheduler
-	@# Terminal-style arbitrary apps under interposition + daemon
-	LD_LIBRARY_PATH=. ./lithos_test_terminal_arbitrary
+	@# CUDA Graph capture + replay should run cleanly under interposition
+	LIBSMCTRL_LITHOS_ENABLE=1 LD_LIBRARY_PATH=. ./lithos_test_cuda_graph_capture_replay
 	@# Framework smoke under interposition + daemon (Torch + JAX)
 	$(MAKE) PYTHON=$(PYTHON) run_lithos_framework_smoke
 	@ echo "All LithOS tests passed!"

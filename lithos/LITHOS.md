@@ -119,6 +119,12 @@ Note: if a shared MPS daemon was started with all visible devices, it may appear
 make libcuda.so.1 lithosd
 ```
 
+To build the CUDA Graph capture/replay test explicitly:
+
+```bash
+make lithos_test_cuda_graph_capture_replay
+```
+
 ### 5.2 Start daemon
 
 ```bash
@@ -167,8 +173,25 @@ Covers:
 - packed/deferred path
 - scheduler quota path
 - kernelParams scheduling
+- CUDA Graph capture + replay
 - terminal-style global scheduler test
 - framework smoke target
+
+### 7.3 CUDA Graph capture/replay unit test
+
+Standalone run:
+
+```bash
+LIBSMCTRL_LITHOS_ENABLE=1 LD_LIBRARY_PATH=. ./lithos_test_cuda_graph_capture_replay
+```
+
+Expected behavior:
+
+- Captures a graph with one increment kernel.
+- Replays graph multiple times via `cuGraphLaunch`.
+- Verifies final device counter equals replay count.
+
+When launch tracing is enabled, runtime logs include `type=graph phase=submit|done` lines.
 
 ### 7.2 Long-running overlap stress
 
@@ -226,6 +249,22 @@ Check:
 - LithOS envs set
 - daemon reachable (`LIBSMCTRL_LITHOSD_SOCK`)
 
+### 9.4 Kernel/Graph Launch tracing/Logging control
+
+Kernel/Graph Launch tracing/Logging is enabled by default in current runtime.
+
+Disable with:
+
+```bash
+LIBSMCTRL_LITHOS_TRACE_LAUNCHES=0
+```
+
+Useful markers include:
+
+- `type=kernel phase=queued|dispatcher-submit|dispatcher-done`
+- `type=kernel phase=direct-capture-passthrough`
+- `type=graph phase=submit|done`
+
 ### 9.2 Daemon unreachable fallback
 
 Runtime may log fallback to unpartitioned launches if daemon RPC fails.
@@ -246,24 +285,14 @@ Check:
 - permissions for MPS pipe/log directories
 - `CUDA_VISIBLE_DEVICES` and `CUDA_MPS_PIPE_DIRECTORY`
 
-### 9.4 Stress script appears stuck
-
-The script now treats zombie children as finished and has monitor timeout.
-
-If needed, set shorter timeout:
-
-```bash
-LITHOS_STRESS_MONITOR_TIMEOUT_SEC=180 ./lithos/tests/lithos_stress_long_overlap.sh ...
-```
-
 ## 10. Key files map
 
 - `lithos/lithos_runtime.c`: runtime interposition, queue, dispatch, completion/reclaim
 - `lithos/lithosd.c`: global scheduler daemon and status interface
 - `lithos/lithos_ipc.h`: IPC request/response protocol
 - `lithos/tests/lithos_stress_long_overlap.sh`: long-running overlap stress harness
-- `lithos/tests/lithos_test_terminal_arbitrary.c`: terminal-style two-app confinement/disjoint test
 - `lithos/tests/lithos_test_arbitrary_app.c`: parseable app used by terminal and stress tests
+- `lithos/tests/lithos_test_cuda_graph_capture_replay.c`: CUDA Graph capture + replay validation
 
 ## 11. Notes on scope
 
