@@ -156,7 +156,7 @@ run_lithos_tests: lithos_tests
 	@# KernelParams launches should also be deferred/scheduled now
 	LIBSMCTRL_LITHOS_ENABLE=1 LIBSMCTRL_LITHOS_SCHED_ENABLE=1 LIBSMCTRL_LITHOS_TPC_QUOTAS=1 LD_LIBRARY_PATH=. ./lithos_test_kernelparams_scheduler
 	@# CUDA Graph capture + replay should run cleanly under interposition
-	LIBSMCTRL_LITHOS_ENABLE=1 LD_LIBRARY_PATH=. ./lithos_test_cuda_graph_capture_replay
+	LIBSMCTRL_LITHOS_ENABLE=1 LIBSMCTRL_LITHOS_SCHED_ENABLE=1 LIBSMCTRL_LITHOS_TPC_QUOTAS=1 LD_LIBRARY_PATH=. ./lithos_test_cuda_graph_capture_replay
 	@# Framework smoke under interposition + daemon (Torch + JAX)
 	$(MAKE) PYTHON=$(PYTHON) run_lithos_framework_smoke
 	@ echo "All LithOS tests passed!"

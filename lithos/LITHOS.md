@@ -119,12 +119,6 @@ Note: if a shared MPS daemon was started with all visible devices, it may appear
 make libcuda.so.1 lithosd
 ```
 
-To build the CUDA Graph capture/replay test explicitly:
-
-```bash
-make lithos_test_cuda_graph_capture_replay
-```
-
 ### 5.2 Start daemon
 
 ```bash
