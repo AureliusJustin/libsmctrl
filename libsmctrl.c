@@ -740,7 +740,7 @@ __attribute__((constructor)) static void setup(void) {
 
 	// Initialize CUDA and the interception callback
 	setup_sm_control_callback();
-	// Phase 0/1/2 LithOS runtime init (interposition + deferred launch queue)
+	// LithOS runtime init (interposition + deferred launch queue)
 	lithos_wrapper_init();
 
 	// Create shared memory region for the supreme mask such that nvtaskset
