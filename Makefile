@@ -32,35 +32,39 @@ libcuda.so.1: libsmctrl.c libsmctrl.h lithos/lithos_runtime.c lithos/lithos_runt
 nvtaskset: nvtaskset.c libsmctrl.so libsmctrl.a
 	$(CC) $@.c -o $@ -L. -l:libsmctrl.a $(CFLAGS) $(LDFLAGS)
 
+# ----- LithOS Interposer Payload -----
+liblithos_preload.so: libsmctrl.c libsmctrl.h lithos/lithos_runtime.c lithos/lithos_runtime.h
+	$(CC) libsmctrl.c lithos/lithos_runtime.c -shared -o $@ -fPIC -DLIBSMCTRL_WRAPPER $(CFLAGS) $(LDFLAGS) -pthread
+
 lithosd: lithos/lithosd.c lithos/lithos_ipc.h
 	$(CC) $< -o $@ -g $(CFLAGS)
 
 libsmctrl_test_gpc_info: libsmctrl_test_gpc_info.c libsmctrl.a testbench.h
 	$(CC) $< -o $@ -g -L. -l:libsmctrl.a $(CFLAGS) $(LDFLAGS)
 
-lithos_test_launch_kernelparams: lithos/tests/lithos_test_launch_kernelparams.c lithos/tests/lithos_test_common.h libcuda.so.1
+lithos_test_launch_kernelparams: lithos/tests/lithos_test_launch_kernelparams.c lithos/tests/lithos_test_common.h liblithos_preload.so
 	$(CC) $< -o $@ -g $(CFLAGS) $(LDFLAGS)
 
-lithos_test_launch_packed: lithos/tests/lithos_test_launch_packed.c lithos/tests/lithos_test_common.h libcuda.so.1
+lithos_test_launch_packed: lithos/tests/lithos_test_launch_packed.c lithos/tests/lithos_test_common.h liblithos_preload.so
 	$(CC) $< -o $@ -g $(CFLAGS) $(LDFLAGS)
 
-lithos_test_scheduler_quota: lithos/tests/lithos_test_scheduler_quota.c lithos/tests/lithos_test_common.h libsmctrl.a libcuda.so.1
+lithos_test_scheduler_quota: lithos/tests/lithos_test_scheduler_quota.c lithos/tests/lithos_test_common.h libsmctrl.a liblithos_preload.so
 	$(CC) $< -o $@ -g -L. -l:libsmctrl.a $(CFLAGS) $(LDFLAGS)
 
-lithos_test_kernelparams_scheduler: lithos/tests/lithos_test_kernelparams_scheduler.c lithos/tests/lithos_test_common.h libsmctrl.a libcuda.so.1
+lithos_test_kernelparams_scheduler: lithos/tests/lithos_test_kernelparams_scheduler.c lithos/tests/lithos_test_common.h libsmctrl.a liblithos_preload.so
 	$(CC) $< -o $@ -g -L. -l:libsmctrl.a $(CFLAGS) $(LDFLAGS)
 
-lithos_test_arbitrary_app: lithos/tests/lithos_test_arbitrary_app.c lithos/tests/lithos_test_common.h libsmctrl.a libcuda.so.1
+lithos_test_arbitrary_app: lithos/tests/lithos_test_arbitrary_app.c lithos/tests/lithos_test_common.h libsmctrl.a liblithos_preload.so
 	$(CC) $< -o $@ -g -L. -l:libsmctrl.a $(CFLAGS) $(LDFLAGS)
 
-lithos_test_cuda_graph_capture_replay: lithos/tests/lithos_test_cuda_graph_capture_replay.c lithos/tests/lithos_test_common.h libcuda.so.1
+lithos_test_cuda_graph_capture_replay: lithos/tests/lithos_test_cuda_graph_capture_replay.c lithos/tests/lithos_test_common.h liblithos_preload.so
 	$(CC) $< -o $@ -g $(CFLAGS) $(LDFLAGS)
 
 run_lithos_framework_smoke: lithosd lithos/tests/lithos_test_framework_smoke.py lithos/tests/lithos_test_torch_large_mm.py lithos/tests/lithos_test_jax_large_mm.py
-	@SOCK=/tmp/lithosd_fw_smoke_$$PPID.sock; \
-	./lithosd $$SOCK 54 >/tmp/lithosd_fw_smoke.log 2>&1 & D=$$!; \
+	@SOCK=/tmp/lithosd.sock; \
+	./lithosd $$SOCK 54 >/tmp/lithosd.log 2>&1 & D=$$!; \
 	trap 'kill $$D 2>/dev/null; wait $$D 2>/dev/null; rm -f $$SOCK' EXIT INT TERM; \
-	LIBSMCTRL_LITHOS_ENABLE=1 LIBSMCTRL_LITHOS_GLOBAL_SCHED_ENABLE=1 LIBSMCTRL_LITHOSD_SOCK=$$SOCK LD_LIBRARY_PATH=. $(PYTHON) ./lithos/tests/lithos_test_framework_smoke.py
+	LIBSMCTRL_LITHOS_ENABLE=1 LIBSMCTRL_LITHOS_GLOBAL_SCHED_ENABLE=1 LIBSMCTRL_LITHOSD_SOCK=$$SOCK LD_PRELOAD=$(PWD)/liblithos_preload.so $(PYTHON) ./lithos/tests/lithos_test_framework_smoke.py
 
 # ----- Tests -----
 libsmctrl_test_mask_shared.o: libsmctrl_test_mask_shared.cu testbench.h
@@ -103,7 +107,7 @@ clean:
 	      lithos_test_scheduler_quota lithos_test_kernelparams_scheduler \
 	      lithos_test_arbitrary_app \
 	      lithosd \
-	      nvtaskset libcuda.so.1
+	      nvtaskset libcuda.so.1 liblithos_preload.so
 
 # On L4T (Linux4Tegra), the paths are different, and there may be multiple copies of libcuda.so.1
 install: libcuda.so.1
@@ -148,15 +152,15 @@ run_tests: tests
 
 run_lithos_tests: lithos_tests
 	@# Pass-through behavior
-	LD_LIBRARY_PATH=. ./lithos_test_launch_kernelparams
+	LD_PRELOAD=$(PWD)/liblithos_preload.so ./lithos_test_launch_kernelparams
 	@# Deferred queue behavior for packed launch args
-	LIBSMCTRL_LITHOS_ENABLE=1 LD_LIBRARY_PATH=. ./lithos_test_launch_packed
+	LIBSMCTRL_LITHOS_ENABLE=1 LD_PRELOAD=$(PWD)/liblithos_preload.so ./lithos_test_launch_packed
 	@# Baseline scheduler: 1 TPC quota on first stream
-	LIBSMCTRL_LITHOS_ENABLE=1 LIBSMCTRL_LITHOS_SCHED_ENABLE=1 LIBSMCTRL_LITHOS_TPC_QUOTAS=1 LD_LIBRARY_PATH=. ./lithos_test_scheduler_quota
+	LIBSMCTRL_LITHOS_ENABLE=1 LIBSMCTRL_LITHOS_SCHED_ENABLE=1 LIBSMCTRL_LITHOS_TPC_QUOTAS=1 LD_PRELOAD=$(PWD)/liblithos_preload.so ./lithos_test_scheduler_quota
 	@# KernelParams launches should also be deferred/scheduled now
-	LIBSMCTRL_LITHOS_ENABLE=1 LIBSMCTRL_LITHOS_SCHED_ENABLE=1 LIBSMCTRL_LITHOS_TPC_QUOTAS=1 LD_LIBRARY_PATH=. ./lithos_test_kernelparams_scheduler
+	LIBSMCTRL_LITHOS_ENABLE=1 LIBSMCTRL_LITHOS_SCHED_ENABLE=1 LIBSMCTRL_LITHOS_TPC_QUOTAS=1 LD_PRELOAD=$(PWD)/liblithos_preload.so ./lithos_test_kernelparams_scheduler
 	@# CUDA Graph capture + replay should run cleanly under interposition
-	LIBSMCTRL_LITHOS_ENABLE=1 LIBSMCTRL_LITHOS_SCHED_ENABLE=1 LIBSMCTRL_LITHOS_TPC_QUOTAS=1 LD_LIBRARY_PATH=. ./lithos_test_cuda_graph_capture_replay
+	LIBSMCTRL_LITHOS_ENABLE=1 LIBSMCTRL_LITHOS_SCHED_ENABLE=1 LIBSMCTRL_LITHOS_TPC_QUOTAS=1 LD_PRELOAD=$(PWD)/liblithos_preload.so ./lithos_test_cuda_graph_capture_replay
 	@# Framework smoke under interposition + daemon (Torch + JAX)
 	$(MAKE) PYTHON=$(PYTHON) run_lithos_framework_smoke
 	@ echo "All LithOS tests passed!"

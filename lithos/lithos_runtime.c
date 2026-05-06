@@ -6,6 +6,7 @@
  * This intentionally keeps policy simple and deterministic so behavior can be
  * validated before adding dynamic stealing and prediction logic.
  */
+#define _GNU_SOURCE // Required for RTLD_NEXT
 #include "lithos_runtime.h"
 
 #ifdef LIBSMCTRL_WRAPPER
@@ -50,6 +51,9 @@ struct launch_item {
 	CUstream stream;
 	void* arg_buffer;
 	size_t arg_buffer_size;
+	bool has_partition;
+	uint64_t disable_mask;
+	CUcontext ctx;
 	struct launch_item* next;
 };
 
@@ -86,6 +90,8 @@ static struct {
 	CUresult (*real_cuStreamQuery)(CUstream);
 	CUresult (*real_cuStreamIsCapturing)(CUstream, CUstreamCaptureStatus*);
 	CUresult (*real_cuGraphLaunch)(CUgraphExec, CUstream);
+	CUresult (*real_cuCtxGetCurrent)(CUcontext*);
+	CUresult (*real_cuCtxSetCurrent)(CUcontext);
 
 	pthread_t dispatcher;
 	pthread_mutex_t mu;
@@ -468,11 +474,23 @@ static void trace_graph_launch(const char* phase,
 	        (int)result);
 }
 
+static void* (*real_dlsym)(void*, const char*) = NULL;
+static __thread bool resolving_dlsym = false;
+
+static void ensure_real_dlsym(void) {
+    if (!real_dlsym) {
+        resolving_dlsym = true;
+        real_dlsym = (void* (*)(void*, const char*)) dlvsym(RTLD_NEXT, "dlsym", "GLIBC_2.2.5");
+        resolving_dlsym = false;
+    }
+}
+
 static void* resolve_real_symbol(const char* name) {
-	void* ptr = dlsym(g_lithos.real_cuda, name);
-	if (!ptr)
-		fail_missing_symbol(name);
-	return ptr;
+    ensure_real_dlsym();
+    void* ptr = real_dlsym(g_lithos.real_cuda, name);
+    if (!ptr)
+        fail_missing_symbol(name);
+    return ptr;
 }
 
 /*** Stream and Queue Bookkeeping ***/
@@ -746,6 +764,10 @@ static void* dispatcher_main(void* arg) {
 			&item->arg_buffer_size,
 			CU_LAUNCH_PARAM_END,
 		};
+		// Bind the context to the dispatcher thread
+		if (item->ctx && g_lithos.real_cuCtxSetCurrent) {
+			g_lithos.real_cuCtxSetCurrent(item->ctx);
+		}
 		CUresult res = direct_launch(item->f,
 		                           item->gx,
 		                           item->gy,
@@ -815,26 +837,30 @@ static void init_real_cuda_once(void) {
 	g_lithos.enabled = false;
 	g_lithos.real_ready = false;
 
-	g_lithos.real_cuda = dlopen("libcuda.so", RTLD_LAZY | RTLD_LOCAL);
+	g_lithos.real_cuda = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL);
 	if (!g_lithos.real_cuda) {
-		fprintf(stderr, "libsmctrl-lithos: unable to open real libcuda.so: %s\n", dlerror());
+		fprintf(stderr, "libsmctrl-lithos: unable to open real libcuda.so.1: %s\n", dlerror());
 		return;
 	}
+
+	ensure_real_dlsym(); // Add this to the top of the block
 
 	g_lithos.real_cuStreamCreate = resolve_real_symbol("cuStreamCreate");
 	g_lithos.real_cuStreamCreateWithPriority = resolve_real_symbol("cuStreamCreateWithPriority");
 	g_lithos.real_cuStreamDestroy = resolve_real_symbol("cuStreamDestroy");
+	g_lithos.real_cuCtxGetCurrent = resolve_real_symbol("cuCtxGetCurrent");
+	g_lithos.real_cuCtxSetCurrent = resolve_real_symbol("cuCtxSetCurrent");
 	g_lithos.real_cuLaunchKernel = resolve_real_symbol("cuLaunchKernel");
-	g_lithos.real_cuFuncGetParamInfo = dlsym(g_lithos.real_cuda, "cuFuncGetParamInfo");
-	g_lithos.real_cuEventCreate = dlsym(g_lithos.real_cuda, "cuEventCreate");
-	g_lithos.real_cuEventRecord = dlsym(g_lithos.real_cuda, "cuEventRecord");
-	g_lithos.real_cuEventQuery = dlsym(g_lithos.real_cuda, "cuEventQuery");
-	g_lithos.real_cuEventDestroy = dlsym(g_lithos.real_cuda, "cuEventDestroy");
+	g_lithos.real_cuFuncGetParamInfo = real_dlsym(g_lithos.real_cuda, "cuFuncGetParamInfo");
+	g_lithos.real_cuEventCreate = real_dlsym(g_lithos.real_cuda, "cuEventCreate");
+	g_lithos.real_cuEventRecord = real_dlsym(g_lithos.real_cuda, "cuEventRecord");
+	g_lithos.real_cuEventQuery = real_dlsym(g_lithos.real_cuda, "cuEventQuery");
+	g_lithos.real_cuEventDestroy = real_dlsym(g_lithos.real_cuda, "cuEventDestroy");
 	g_lithos.real_cuStreamSynchronize = resolve_real_symbol("cuStreamSynchronize");
 	g_lithos.real_cuCtxSynchronize = resolve_real_symbol("cuCtxSynchronize");
 	g_lithos.real_cuStreamQuery = resolve_real_symbol("cuStreamQuery");
-	g_lithos.real_cuStreamIsCapturing = dlsym(g_lithos.real_cuda, "cuStreamIsCapturing");
-	g_lithos.real_cuGraphLaunch = dlsym(g_lithos.real_cuda, "cuGraphLaunch");
+	g_lithos.real_cuStreamIsCapturing = real_dlsym(g_lithos.real_cuda, "cuStreamIsCapturing");
+	g_lithos.real_cuGraphLaunch = real_dlsym(g_lithos.real_cuda, "cuGraphLaunch");
 	if (!g_lithos.real_cuStreamCreate ||
 	    !g_lithos.real_cuStreamCreateWithPriority ||
 	    !g_lithos.real_cuStreamDestroy ||
@@ -1050,6 +1076,11 @@ CUresult cuLaunchKernel(CUfunction f,
 	item->shared_mem = sharedMemBytes;
 	item->stream = hStream;
 
+	item->ctx = NULL;
+	if (g_lithos.real_cuCtxGetCurrent) {
+		g_lithos.real_cuCtxGetCurrent(&item->ctx);
+	}
+
 	pthread_mutex_lock(&g_lithos.mu);
 	struct stream_state* st = get_or_create_stream_state_locked(hStream);
 	if (!st) {
@@ -1234,6 +1265,200 @@ CUresult cuGraphLaunch(CUgraphExec hGraphExec, CUstream hStream) {
 	               res);
 
 	return res;
+}
+
+static void* get_real_driver_func(const char* name) {
+    ensure_real_dlsym();
+    return real_dlsym(g_lithos.real_cuda, name);
+}
+
+CUresult cuLaunchKernel_ptsz(CUfunction f, unsigned int gx, unsigned int gy, unsigned int gz, 
+                             unsigned int bx, unsigned int by, unsigned int bz, 
+                             unsigned int sharedMemBytes, CUstream hStream, void** kernelParams, void** extra) {
+    
+    // Map NULL stream to the Hardware Per-Thread Stream
+    CUstream actual_stream = hStream ? hStream : (CUstream)2;
+    return cuLaunchKernel(f, gx, gy, gz, bx, by, bz, sharedMemBytes, actual_stream, kernelParams, extra);
+}
+
+CUresult cuLaunchKernelEx(const CUlaunchConfig *config, CUfunction f, void **kernelParams, void **extra) {
+    if (!config) return CUDA_ERROR_INVALID_VALUE;
+    
+    // Unpack the extended config and funnel it into our central queue
+    return cuLaunchKernel(f, config->gridDimX, config->gridDimY, config->gridDimZ,
+                          config->blockDimX, config->blockDimY, config->blockDimZ,
+                          config->sharedMemBytes, config->hStream, kernelParams, extra);
+}
+
+CUresult cuLaunchKernelEx_ptsz(const CUlaunchConfig *config, CUfunction f, void **kernelParams, void **extra) {
+    if (!config) return CUDA_ERROR_INVALID_VALUE;
+    
+    // Map to Per-Thread Default Stream, then funnel into our queue
+    CUstream actual_stream = config->hStream ? config->hStream : (CUstream)2;
+    return cuLaunchKernel(f, config->gridDimX, config->gridDimY, config->gridDimZ,
+                          config->blockDimX, config->blockDimY, config->blockDimZ,
+                          config->sharedMemBytes, actual_stream, kernelParams, extra);
+}
+
+CUresult cuStreamSynchronize_ptsz(CUstream hStream) {
+    lithos_wrapper_init();
+    if (g_lithos.enabled) wait_stream_queue_drained(hStream);
+    static CUresult (*real)(CUstream) = NULL;
+    if (!real) real = get_real_driver_func("cuStreamSynchronize_ptsz");
+    return real ? real(hStream) : CUDA_ERROR_NOT_INITIALIZED;
+}
+
+CUresult cuStreamQuery_ptsz(CUstream hStream) {
+    lithos_wrapper_init();
+    if (g_lithos.enabled) {
+        pthread_mutex_lock(&g_lithos.mu);
+        struct stream_state* st = get_or_create_stream_state_locked(hStream);
+        reap_completed_launches_locked(hStream, true, false);
+        bool pending = st && (st->pending || st->inflight || has_active_launches_for_stream_locked(hStream));
+        pthread_mutex_unlock(&g_lithos.mu);
+        if (pending) return CUDA_ERROR_NOT_READY;
+    }
+    static CUresult (*real)(CUstream) = NULL;
+    if (!real) real = get_real_driver_func("cuStreamQuery_ptsz");
+    return real ? real(hStream) : CUDA_ERROR_NOT_INITIALIZED;
+}
+
+CUresult cuGraphLaunch_ptsz(CUgraphExec hGraphExec, CUstream hStream) {
+    return cuGraphLaunch(hGraphExec, hStream ? hStream : (CUstream)2);
+}
+
+// QUEUE SYNCHRONIZATION WRAPPERS
+
+CUresult cuMemFree(CUdeviceptr dptr) {
+    lithos_wrapper_init();
+    if (g_lithos.enabled) {
+        wait_all_queues_drained();
+    }
+    
+    static CUresult (*real_v2)(CUdeviceptr) = NULL;
+    if (!real_v2) {
+        real_v2 = (CUresult (*)(CUdeviceptr))real_dlsym(g_lithos.real_cuda, "cuMemFree_v2");
+    }
+    return real_v2(dptr);
+}
+
+CUresult cuEventRecord(CUevent hEvent, CUstream hStream) {
+    lithos_wrapper_init();
+    if (g_lithos.enabled) wait_stream_queue_drained(hStream);
+    static CUresult (*real)(CUevent, CUstream) = NULL;
+    if (!real) real = get_real_driver_func("cuEventRecord");
+    return real ? real(hEvent, hStream) : CUDA_ERROR_NOT_INITIALIZED;
+}
+
+CUresult cuEventRecord_ptsz(CUevent hEvent, CUstream hStream) {
+    lithos_wrapper_init();
+    if (g_lithos.enabled) wait_stream_queue_drained(hStream);
+    static CUresult (*real)(CUevent, CUstream) = NULL;
+    if (!real) real = get_real_driver_func("cuEventRecord_ptsz");
+    return real ? real(hEvent, hStream) : CUDA_ERROR_NOT_INITIALIZED;
+}
+
+CUresult cuMemFreeAsync(CUdeviceptr dptr, CUstream hStream) {
+    lithos_wrapper_init();
+    if (g_lithos.enabled) wait_stream_queue_drained(hStream);
+    static CUresult (*real)(CUdeviceptr, CUstream) = NULL;
+    if (!real) real = get_real_driver_func("cuMemFreeAsync");
+    return real ? real(dptr, hStream) : CUDA_ERROR_NOT_INITIALIZED;
+}
+
+CUresult cuMemFreeAsync_ptsz(CUdeviceptr dptr, CUstream hStream) {
+    lithos_wrapper_init();
+    if (g_lithos.enabled) wait_stream_queue_drained(hStream);
+    static CUresult (*real)(CUdeviceptr, CUstream) = NULL;
+    if (!real) real = get_real_driver_func("cuMemFreeAsync_ptsz");
+    return real ? real(dptr, hStream) : CUDA_ERROR_NOT_INITIALIZED;
+}
+
+// frameworks/library like pytorch may call cuGetProcAddress directly to bypass dlsym interception, so we need to intercept cuGetProcAddress itself and override returned function pointers for any intercepted APIs to ensure consistent behavior regardless of how the function is resolved.
+CUresult CUDAAPI cuGetProcAddress(const char *symbol, void **pfn, int cudaVersion, cuuint64_t flags, CUdriverProcAddressQueryResult *symbolStatus) {
+    lithos_wrapper_init();
+	
+	// Debug
+	// fprintf(stderr, "[LITHOS DEBUG] cuGetProcAddress asked for: %s\n", symbol);
+    // fflush(stderr);
+    
+    static CUresult (*real_cuGetProcAddress)(const char *, void **, int, cuuint64_t, CUdriverProcAddressQueryResult *) = NULL;
+    
+    if (!real_cuGetProcAddress) {
+        ensure_real_dlsym();
+        real_cuGetProcAddress = (CUresult (*)(const char *, void **, int, cuuint64_t, CUdriverProcAddressQueryResult *))real_dlsym(g_lithos.real_cuda, "cuGetProcAddress_v2");
+    }
+
+    // Call the real function to populate pfn with the real driver pointer
+    CUresult res = real_cuGetProcAddress(symbol, pfn, cudaVersion, flags, symbolStatus);
+    if (res != CUDA_SUCCESS) return res;
+
+    // Override the returned pointer with our intercepted versions
+    if (strcmp(symbol, "cuLaunchKernel") == 0) *pfn = (void*)&cuLaunchKernel;
+	else if (strcmp(symbol, "cuLaunchKernelEx") == 0) *pfn = (void*)&cuLaunchKernelEx;
+    else if (strcmp(symbol, "cuLaunchKernelEx_ptsz") == 0) *pfn = (void*)&cuLaunchKernelEx_ptsz;
+    else if (strcmp(symbol, "cuLaunchKernel_ptsz") == 0) *pfn = (void*)&cuLaunchKernel_ptsz;
+    else if (strcmp(symbol, "cuStreamCreate") == 0) *pfn = (void*)&cuStreamCreate;
+    else if (strcmp(symbol, "cuStreamCreateWithPriority") == 0) *pfn = (void*)&cuStreamCreateWithPriority;
+    else if (strcmp(symbol, "cuStreamDestroy") == 0) *pfn = (void*)&cuStreamDestroy;
+    else if (strcmp(symbol, "cuStreamSynchronize") == 0) *pfn = (void*)&cuStreamSynchronize;
+    else if (strcmp(symbol, "cuStreamSynchronize_ptsz") == 0) *pfn = (void*)&cuStreamSynchronize_ptsz;
+	else if (strcmp(symbol, "cuStreamQuery") == 0) *pfn = (void*)&cuStreamQuery;
+    else if (strcmp(symbol, "cuStreamQuery_ptsz") == 0) *pfn = (void*)&cuStreamQuery_ptsz;
+    else if (strcmp(symbol, "cuCtxSynchronize") == 0) *pfn = (void*)&cuCtxSynchronize;
+    else if (strcmp(symbol, "cuGraphLaunch") == 0) *pfn = (void*)&cuGraphLaunch;
+    else if (strcmp(symbol, "cuGraphLaunch_ptsz") == 0) *pfn = (void*)&cuGraphLaunch_ptsz;
+    else if (strcmp(symbol, "cuMemFree") == 0 || strcmp(symbol, "cuMemFree_v2") == 0) *pfn = (void*)&cuMemFree;
+    else if (strcmp(symbol, "cuMemFreeAsync") == 0) *pfn = (void*)&cuMemFreeAsync;
+    else if (strcmp(symbol, "cuMemFreeAsync_ptsz") == 0) *pfn = (void*)&cuMemFreeAsync_ptsz;
+    else if (strcmp(symbol, "cuEventRecord") == 0) *pfn = (void*)&cuEventRecord;
+    else if (strcmp(symbol, "cuEventRecord_ptsz") == 0) *pfn = (void*)&cuEventRecord_ptsz;
+
+    return CUDA_SUCCESS;
+}
+
+//DLSYM INTERCEPTOR
+void* dlsym(void* handle, const char* symbol) {
+    if (!real_dlsym) {
+        if (resolving_dlsym) return NULL; 
+        ensure_real_dlsym();
+    }
+
+    if (!symbol) return NULL;
+
+	// Debug
+	// fprintf(stderr, "[LITHOS DEBUG] dlsym asked for: %s\n", symbol);
+    // fflush(stderr);
+
+	// Hook cuGetProcAddress (Crucial for PyTorch >= 2.0)
+    if (strcmp(symbol, "cuGetProcAddress") == 0 || strcmp(symbol, "cuGetProcAddress_v2") == 0) {
+        return (void*)&cuGetProcAddress; // The macro automatically points this to your _v2 wrapper
+    }
+    // 1. Core Launch & Stream API
+    if (strcmp(symbol, "cuLaunchKernel") == 0) return (void*)&cuLaunchKernel;
+    if (strcmp(symbol, "cuLaunchKernel_ptsz") == 0) return (void*)&cuLaunchKernel_ptsz;
+	if (strcmp(symbol, "cuLaunchKernelEx") == 0) return (void*)&cuLaunchKernelEx;
+    if (strcmp(symbol, "cuLaunchKernelEx_ptsz") == 0) return (void*)&cuLaunchKernelEx_ptsz;
+    if (strcmp(symbol, "cuStreamCreate") == 0) return (void*)&cuStreamCreate;
+    if (strcmp(symbol, "cuStreamCreateWithPriority") == 0) return (void*)&cuStreamCreateWithPriority;
+    if (strcmp(symbol, "cuStreamDestroy") == 0) return (void*)&cuStreamDestroy;
+    if (strcmp(symbol, "cuStreamSynchronize") == 0) return (void*)&cuStreamSynchronize;
+    if (strcmp(symbol, "cuStreamSynchronize_ptsz") == 0) return (void*)&cuStreamSynchronize_ptsz;
+    if (strcmp(symbol, "cuCtxSynchronize") == 0) return (void*)&cuCtxSynchronize;
+    if (strcmp(symbol, "cuStreamQuery") == 0) return (void*)&cuStreamQuery;
+    if (strcmp(symbol, "cuStreamQuery_ptsz") == 0) return (void*)&cuStreamQuery_ptsz;
+    if (strcmp(symbol, "cuGraphLaunch") == 0) return (void*)&cuGraphLaunch;
+    if (strcmp(symbol, "cuGraphLaunch_ptsz") == 0) return (void*)&cuGraphLaunch_ptsz;
+
+    // 2. Queue Drains
+    if (strcmp(symbol, "cuEventRecord") == 0) return (void*)&cuEventRecord;
+    if (strcmp(symbol, "cuEventRecord_ptsz") == 0) return (void*)&cuEventRecord_ptsz;
+    if (strcmp(symbol, "cuMemFreeAsync") == 0) return (void*)&cuMemFreeAsync;
+    if (strcmp(symbol, "cuMemFreeAsync_ptsz") == 0) return (void*)&cuMemFreeAsync_ptsz;
+	if (strcmp(symbol, "cuMemFree") == 0 || strcmp(symbol, "cuMemFree_v2") == 0) return (void*)&cuMemFree;
+
+    // 4. Pass everything else to real driver
+    return real_dlsym(handle, symbol);
 }
 
 #endif

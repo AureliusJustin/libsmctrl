@@ -116,7 +116,7 @@ Note: if a shared MPS daemon was started with all visible devices, it may appear
 ### 5.1 Build core binaries
 
 ```bash
-make libcuda.so.1 lithosd
+make liblithos_preload.so lithosd
 ```
 
 ### 5.2 Start daemon

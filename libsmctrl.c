@@ -683,18 +683,6 @@ uint128_t strtou128(const char *nptr, char **endptr, int base) {
 }
 
 #ifdef LIBSMCTRL_WRAPPER
-// The CUDA runtime library uses dlopen() to load CUDA functions from
-// libcuda.so.1. Since we replace that with our wrapper library, we need to
-// also redirect any attempted opens of that shared object to the actual
-// shared library, which is linked to by libcuda.so.
-void *dlopen(const char *filename, int flags) {
-	if (filename && strcmp(filename, "libcuda.so") == 0) {
-		fprintf(stderr, "redirecting dlopen of %s to libcuda.so\n", filename);
-		// A GNU-only dlopen variant
-		return dlmopen(LM_ID_BASE, "libcuda.so", flags);
-	} else
-		return dlmopen(LM_ID_BASE, filename, flags);
-}
 
 // Allow setting a default mask via an environment variable
 // Also enables libsmctrl to be used on unmodified programs via setting:
