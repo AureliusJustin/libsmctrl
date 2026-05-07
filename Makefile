@@ -60,7 +60,7 @@ lithos_test_arbitrary_app: lithos/tests/lithos_test_arbitrary_app.c lithos/tests
 lithos_test_cuda_graph_capture_replay: lithos/tests/lithos_test_cuda_graph_capture_replay.c lithos/tests/lithos_test_common.h liblithos_preload.so
 	$(CC) $< -o $@ -g $(CFLAGS) $(LDFLAGS)
 
-run_lithos_framework_smoke: lithosd lithos/tests/lithos_test_framework_smoke.py lithos/tests/lithos_test_torch_large_mm.py lithos/tests/lithos_test_jax_large_mm.py
+run_lithos_framework_smoke: lithosd lithos/tests/lithos_test_framework_smoke.py lithos/tests/lithos_test_torch_large_mm.py lithos/tests/lithos_test_jax_large_mm.py lithos/tests/lithos_test_triton_large_mm.py lithos/tests/lithos_test_tf_large_mm.py
 	@SOCK=/tmp/lithosd.sock; \
 	./lithosd $$SOCK 54 >/tmp/lithosd.log 2>&1 & D=$$!; \
 	trap 'kill $$D 2>/dev/null; wait $$D 2>/dev/null; rm -f $$SOCK' EXIT INT TERM; \
@@ -161,6 +161,6 @@ run_lithos_tests: lithos_tests
 	LIBSMCTRL_LITHOS_ENABLE=1 LIBSMCTRL_LITHOS_SCHED_ENABLE=1 LIBSMCTRL_LITHOS_TPC_QUOTAS=1 LD_PRELOAD=$(PWD)/liblithos_preload.so ./lithos_test_kernelparams_scheduler
 	@# CUDA Graph capture + replay should run cleanly under interposition
 	LIBSMCTRL_LITHOS_ENABLE=1 LIBSMCTRL_LITHOS_SCHED_ENABLE=1 LIBSMCTRL_LITHOS_TPC_QUOTAS=1 LD_PRELOAD=$(PWD)/liblithos_preload.so ./lithos_test_cuda_graph_capture_replay
-	@# Framework smoke under interposition + daemon (Torch + JAX)
+	@# Framework smoke under interposition + daemon (Torch + JAX + Triton + TensorFlow)
 	$(MAKE) PYTHON=$(PYTHON) run_lithos_framework_smoke
 	@ echo "All LithOS tests passed!"
