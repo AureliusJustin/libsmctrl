@@ -2,21 +2,31 @@
 """Run Torch, JAX, Triton, and TensorFlow large-matmul LithOS tests."""
 
 from pathlib import Path
-import subprocess
 import sys
-
+import subprocess, sys, threading
 
 def run_case(name: str, script_path: Path) -> int:
-    proc = subprocess.run(
+    proc = subprocess.Popen(
         [sys.executable, str(script_path)],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=300,
     )
-    if proc.stdout:
-        print(proc.stdout, end="")
-    if proc.stderr:
-        print(proc.stderr, end="", file=sys.stderr)
+
+    def stream_stderr():
+        assert proc.stderr is not None
+        for line in proc.stderr:
+            sys.stderr.write(f"[{name}] {line}")
+            sys.stderr.flush()
+
+    t = threading.Thread(target=stream_stderr, daemon=True)
+    t.start()
+
+    stdout, _ = proc.communicate(timeout=300)
+    t.join()
+
+    if stdout:
+        print(stdout, end="")
     print(f"[{name}] exit={proc.returncode}")
     return proc.returncode
 

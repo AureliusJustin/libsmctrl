@@ -1374,13 +1374,57 @@ CUresult cuMemFreeAsync_ptsz(CUdeviceptr dptr, CUstream hStream) {
     return real ? real(dptr, hStream) : CUDA_ERROR_NOT_INITIALIZED;
 }
 
+static CUresult lithos_cuGetExportTable(const void **ppExportTable, const CUuuid *pExportTableId) {
+    static CUresult (*real)(const void **, const CUuuid *) = NULL;
+    if (!real) {
+        ensure_real_dlsym();
+        real = (CUresult (*)(const void **, const CUuuid *))
+               real_dlsym(g_lithos.real_cuda, "cuGetExportTable");
+    }
+
+    CUresult res = real(ppExportTable, pExportTableId);
+    if (res != CUDA_SUCCESS || !ppExportTable || !*ppExportTable)
+        return res;
+
+    // Get the real driver's actual function addresses so we know what to replace.
+    // We must look these up from the real libcuda.so, not from ourselves.
+    static void *real_launch    = NULL;
+    static void *real_launch_ex = NULL;
+    if (!real_launch)    real_launch    = real_dlsym(g_lithos.real_cuda, "cuLaunchKernel");
+    if (!real_launch_ex) real_launch_ex = real_dlsym(g_lithos.real_cuda, "cuLaunchKernelEx");
+
+    // The export table layout: first word is the byte size of the table,
+    // followed by function pointer slots. Scan and patch any slot that holds
+    // the real driver's launch functions.
+    void **table = (void **)*ppExportTable;
+    if (!table || !table[0]) return res;
+
+    // First entry encodes table byte size; divide to get slot count.
+    size_t byte_size = (size_t)table[0];
+    size_t nslots    = byte_size / sizeof(void *);
+    if (nslots > 512) nslots = 512; // sanity cap — no real table is this large
+
+    for (size_t i = 1; i < nslots; i++) {
+        if (real_launch    && table[i] == real_launch)    table[i] = (void *)&cuLaunchKernel;
+        if (real_launch_ex && table[i] == real_launch_ex) table[i] = (void *)&cuLaunchKernelEx;
+    }
+
+    return res;
+}
+
+// cuda.h defines: #define cuGetProcAddress cuGetProcAddress_v2
+// We must undef it here so the linker sees both symbols as distinct
+// exports in our .so — one for old callers, one for CUDA 11.3+ callers
+// (PyTorch) whose import table references cuGetProcAddress_v2 directly.
+#undef cuGetProcAddress
+
 // frameworks/library like pytorch may call cuGetProcAddress directly to bypass dlsym interception, so we need to intercept cuGetProcAddress itself and override returned function pointers for any intercepted APIs to ensure consistent behavior regardless of how the function is resolved.
 CUresult CUDAAPI cuGetProcAddress(const char *symbol, void **pfn, int cudaVersion, cuuint64_t flags, CUdriverProcAddressQueryResult *symbolStatus) {
     lithos_wrapper_init();
 	
 	// Debug
-	// fprintf(stderr, "[LITHOS DEBUG] cuGetProcAddress asked for: %s\n", symbol);
-    // fflush(stderr);
+	fprintf(stderr, "[LITHOS DEBUG] cuGetProcAddress asked for: %s\n", symbol);
+    fflush(stderr);
     
     static CUresult (*real_cuGetProcAddress)(const char *, void **, int, cuuint64_t, CUdriverProcAddressQueryResult *) = NULL;
     
@@ -1393,29 +1437,60 @@ CUresult CUDAAPI cuGetProcAddress(const char *symbol, void **pfn, int cudaVersio
     CUresult res = real_cuGetProcAddress(symbol, pfn, cudaVersion, flags, symbolStatus);
     if (res != CUDA_SUCCESS) return res;
 
-    // Override the returned pointer with our intercepted versions
-    if (strcmp(symbol, "cuLaunchKernel") == 0) *pfn = (void*)&cuLaunchKernel;
-	else if (strcmp(symbol, "cuLaunchKernelEx") == 0) *pfn = (void*)&cuLaunchKernelEx;
-    else if (strcmp(symbol, "cuLaunchKernelEx_ptsz") == 0) *pfn = (void*)&cuLaunchKernelEx_ptsz;
-    else if (strcmp(symbol, "cuLaunchKernel_ptsz") == 0) *pfn = (void*)&cuLaunchKernel_ptsz;
-    else if (strcmp(symbol, "cuStreamCreate") == 0) *pfn = (void*)&cuStreamCreate;
-    else if (strcmp(symbol, "cuStreamCreateWithPriority") == 0) *pfn = (void*)&cuStreamCreateWithPriority;
-    else if (strcmp(symbol, "cuStreamDestroy") == 0) *pfn = (void*)&cuStreamDestroy;
-    else if (strcmp(symbol, "cuStreamSynchronize") == 0) *pfn = (void*)&cuStreamSynchronize;
-    else if (strcmp(symbol, "cuStreamSynchronize_ptsz") == 0) *pfn = (void*)&cuStreamSynchronize_ptsz;
-	else if (strcmp(symbol, "cuStreamQuery") == 0) *pfn = (void*)&cuStreamQuery;
-    else if (strcmp(symbol, "cuStreamQuery_ptsz") == 0) *pfn = (void*)&cuStreamQuery_ptsz;
-    else if (strcmp(symbol, "cuCtxSynchronize") == 0) *pfn = (void*)&cuCtxSynchronize;
-    else if (strcmp(symbol, "cuGraphLaunch") == 0) *pfn = (void*)&cuGraphLaunch;
-    else if (strcmp(symbol, "cuGraphLaunch_ptsz") == 0) *pfn = (void*)&cuGraphLaunch_ptsz;
-    else if (strcmp(symbol, "cuMemFree") == 0 || strcmp(symbol, "cuMemFree_v2") == 0) *pfn = (void*)&cuMemFree;
-    else if (strcmp(symbol, "cuMemFreeAsync") == 0) *pfn = (void*)&cuMemFreeAsync;
-    else if (strcmp(symbol, "cuMemFreeAsync_ptsz") == 0) *pfn = (void*)&cuMemFreeAsync_ptsz;
-    else if (strcmp(symbol, "cuEventRecord") == 0) *pfn = (void*)&cuEventRecord;
-    else if (strcmp(symbol, "cuEventRecord_ptsz") == 0) *pfn = (void*)&cuEventRecord_ptsz;
+	// Override the returned pointer with our intercepted versions
+    #define IS_PTDS(f) ((f) & CU_GET_PROC_ADDRESS_PER_THREAD_DEFAULT_STREAM)
+
+    if (strcmp(symbol, "cuLaunchKernel") == 0)
+        *pfn = IS_PTDS(flags) ? (void*)&cuLaunchKernel_ptsz : (void*)&cuLaunchKernel;
+    else if (strcmp(symbol, "cuLaunchKernelEx") == 0)
+        *pfn = IS_PTDS(flags) ? (void*)&cuLaunchKernelEx_ptsz : (void*)&cuLaunchKernelEx;
+    else if (strcmp(symbol, "cuLaunchKernel_ptsz") == 0)
+        *pfn = (void*)&cuLaunchKernel_ptsz;
+    else if (strcmp(symbol, "cuLaunchKernelEx_ptsz") == 0)
+        *pfn = (void*)&cuLaunchKernelEx_ptsz;
+    else if (strcmp(symbol, "cuStreamCreate") == 0)
+        *pfn = (void*)&cuStreamCreate;
+    else if (strcmp(symbol, "cuStreamCreateWithPriority") == 0)
+        *pfn = (void*)&cuStreamCreateWithPriority;
+    else if (strcmp(symbol, "cuStreamDestroy") == 0)
+        *pfn = (void*)&cuStreamDestroy;
+    else if (strcmp(symbol, "cuStreamSynchronize") == 0)
+        *pfn = IS_PTDS(flags) ? (void*)&cuStreamSynchronize_ptsz : (void*)&cuStreamSynchronize;
+    else if (strcmp(symbol, "cuStreamSynchronize_ptsz") == 0)
+        *pfn = (void*)&cuStreamSynchronize_ptsz;
+    else if (strcmp(symbol, "cuStreamQuery") == 0)
+        *pfn = IS_PTDS(flags) ? (void*)&cuStreamQuery_ptsz : (void*)&cuStreamQuery;
+    else if (strcmp(symbol, "cuStreamQuery_ptsz") == 0)
+        *pfn = (void*)&cuStreamQuery_ptsz;
+    else if (strcmp(symbol, "cuCtxSynchronize") == 0)
+        *pfn = (void*)&cuCtxSynchronize;
+    else if (strcmp(symbol, "cuGraphLaunch") == 0)
+        *pfn = IS_PTDS(flags) ? (void*)&cuGraphLaunch_ptsz : (void*)&cuGraphLaunch;
+    else if (strcmp(symbol, "cuGraphLaunch_ptsz") == 0)
+        *pfn = (void*)&cuGraphLaunch_ptsz;
+    else if (strcmp(symbol, "cuMemFree") == 0 || strcmp(symbol, "cuMemFree_v2") == 0)
+        *pfn = (void*)&cuMemFree;
+    else if (strcmp(symbol, "cuMemFreeAsync") == 0)
+        *pfn = IS_PTDS(flags) ? (void*)&cuMemFreeAsync_ptsz : (void*)&cuMemFreeAsync;
+    else if (strcmp(symbol, "cuMemFreeAsync_ptsz") == 0)
+        *pfn = (void*)&cuMemFreeAsync_ptsz;
+    else if (strcmp(symbol, "cuEventRecord") == 0)
+        *pfn = IS_PTDS(flags) ? (void*)&cuEventRecord_ptsz : (void*)&cuEventRecord;
+    else if (strcmp(symbol, "cuEventRecord_ptsz") == 0)
+        *pfn = (void*)&cuEventRecord_ptsz;
+
+    #undef IS_PTDS
 
     return CUDA_SUCCESS;
 }
+
+// CUDA 11.3+ headers #define cuGetProcAddress to cuGetProcAddress_v2.
+// PyTorch (and other frameworks compiled against CUDA 11.3+) have
+// cuGetProcAddress_v2 in their .so import table, not cuGetProcAddress.
+// Without this alias, LD_PRELOAD interception of cuGetProcAddress is
+// skipped for those callers and they get real driver function pointers.
+CUresult CUDAAPI cuGetProcAddress_v2(const char *symbol, void **pfn, int cudaVersion, cuuint64_t flags, CUdriverProcAddressQueryResult *symbolStatus)
+    __attribute__((alias("cuGetProcAddress")));
 
 //DLSYM INTERCEPTOR
 void* dlsym(void* handle, const char* symbol) {
@@ -1427,12 +1502,12 @@ void* dlsym(void* handle, const char* symbol) {
     if (!symbol) return NULL;
 
 	// Debug
-	// fprintf(stderr, "[LITHOS DEBUG] dlsym asked for: %s\n", symbol);
-    // fflush(stderr);
+	fprintf(stderr, "[LITHOS DEBUG] dlsym asked for: %s\n", symbol);
+    fflush(stderr);
 
 	// Hook cuGetProcAddress (Crucial for PyTorch >= 2.0)
     if (strcmp(symbol, "cuGetProcAddress") == 0 || strcmp(symbol, "cuGetProcAddress_v2") == 0) {
-        return (void*)&cuGetProcAddress; // The macro automatically points this to your _v2 wrapper
+        return (void*)&cuGetProcAddress;
     }
     // 1. Core Launch & Stream API
     if (strcmp(symbol, "cuLaunchKernel") == 0) return (void*)&cuLaunchKernel;
@@ -1456,6 +1531,9 @@ void* dlsym(void* handle, const char* symbol) {
     if (strcmp(symbol, "cuMemFreeAsync") == 0) return (void*)&cuMemFreeAsync;
     if (strcmp(symbol, "cuMemFreeAsync_ptsz") == 0) return (void*)&cuMemFreeAsync_ptsz;
 	if (strcmp(symbol, "cuMemFree") == 0 || strcmp(symbol, "cuMemFree_v2") == 0) return (void*)&cuMemFree;
+
+	// Export table is used by frameworks like PyTorch to discover available CUDA APIs, so we need to ensure it points to our interposed versions for consistency.
+	if (strcmp(symbol, "cuGetExportTable") == 0) return (void*)&lithos_cuGetExportTable;
 
     // 4. Pass everything else to real driver
     return real_dlsym(handle, symbol);
