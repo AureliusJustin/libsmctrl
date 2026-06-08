@@ -47,7 +47,12 @@ int main(int argc, char** argv) {
 		fprintf(stderr, "%s: Unable to initialize CUDA, error %s\n", program_invocation_name, name);
 		return 1;
 	}
+	// cuCtxCreate gained a CUctxCreateParams* parameter in CUDA 13.0 (v4 API)
+#if CUDA_VERSION >= 13000
+	if ((res = cuCtxCreate(&ctx, NULL, 0, gpu_id))) {
+#else
 	if ((res = cuCtxCreate(&ctx, 0, gpu_id))) {
+#endif
 		const char* name;
 		cuGetErrorName(res, &name);
 		fprintf(stderr, "%s: Unable to create a CUDA context, error %s\n", program_invocation_name, name);

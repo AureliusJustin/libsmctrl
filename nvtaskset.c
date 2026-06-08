@@ -101,7 +101,12 @@ void libsmctrl_get_gpc_info_ext_easy(uint32_t* num_gpcs, uint128_t** masks, int 
 		cuGetErrorName(res, &name);
 		error(1, 0, "Unable to create a initialize CUDA, error %s", name);
 	}
+	// cuCtxCreate gained a CUctxCreateParams* parameter in CUDA 13.0 (v4 API)
+#if CUDA_VERSION >= 13000
+	if ((res = cuCtxCreate(&ctx, NULL, 0, gpu_id))) {
+#else
 	if ((res = cuCtxCreate(&ctx, 0, gpu_id))) {
+#endif
 		const char* name;
 		cuGetErrorName(res, &name);
 		error(1, 0, "Unable to create a CUDA context, error %s", name);
